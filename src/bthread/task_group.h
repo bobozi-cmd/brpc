@@ -54,6 +54,11 @@ private:
 // On X86, SSE instructions can ensure atomic loads and stores.
 // Starting from Armv8.4-A, neon can ensure atomic loads and stores.
 // Otherwise, use mutex to guarantee atomicity.
+/*
+ * - x86 使用对齐 SSE load/store;
+ * - ARM NEON 平台使用向量 load/store;
+ * - 其他平台用 mutex
+ */
 class AtomicInteger128 {
 public:
     struct BAIDU_CACHELINE_ALIGNMENT Value {
@@ -77,10 +82,9 @@ private:
     FastPthreadMutex _mutex;
 };
 
-// Thread-local group of tasks.
-// Notice that most methods involving context switching are static otherwise
-// pointer `this' may change after wakeup. The **pg parameters in following
-// function are updated before returning.
+// 一个 TaskGroup 对应一个 worker pthread 上的 thread-local 调度器
+// 保存当前 bthread & 就绪队列, 执行上下文切换, 和 global TaskControl 协作完成工作窃取 & worker 唤醒
+// 一个 bthread 并不永久属于某个 TaskGroup, 可能被其他 worker 窃取, 在另一个 TaskGroup 上继续运行
 class TaskGroup {
 public:
     // Create task `fn(arg)' with attributes `attr' in TaskGroup *pg and put
@@ -111,13 +115,17 @@ public:
     // Suspend caller and run bthread `next_tid' in TaskGroup *pg.
     // Purpose of this function is to avoid pushing `next_tid' to _rq and
     // then being popped by sched(pg), which is not necessary.
+    
+    /*
+     * 为什么 sched_to 是 static 的, 并且接收 TaskGroup**?
+     * 一个 bthread 挂起后, 可能被另一个 worker steal: `A 在 pg1 上挂起 -> 被 worker2 steal -> 在 pg2 上恢复`.
+     * 所以 sched_to 返回时, 原来的 this 可能已经变成其他 worker 的TaskGroup, 所以不能依赖this, 通过返回前重新读取 TLS, 将pg更新成恢复后真正所在的 TaskGroup
+    */
     static void sched_to(TaskGroup** pg, TaskMeta* next_meta);
     static void sched_to(TaskGroup** pg, bthread_t next_tid);
     static void exchange(TaskGroup** pg, TaskMeta* next_meta);
 
-    // The callback will be run in the beginning of next-run bthread.
-    // Can't be called by current bthread directly because it often needs
-    // the target to be suspended already.
+    // 必须等当前上下文已经停止运行之后，才能执行的收尾操作
     typedef void (*RemainedFn)(void*);
     void set_remained(RemainedFn cb, void* arg) {
         _last_context_remained = cb;
@@ -180,18 +188,17 @@ public:
     // Active time in nanoseconds spent by this TaskGroup.
     int64_t cumulated_cputime_ns() const;
 
-    // Push a bthread into the runqueue
+    // 当前 TaskGroup 调用, 向 _rq 投递任务
     void ready_to_run(TaskMeta* meta, bool nosignal = false);
     // Flush tasks pushed to rq but signalled.
     void flush_nosignal_tasks();
 
-    // Push a bthread into the runqueue from another non-worker thread.
+    // 外部线程调用, 向 _remote_rq 投递任务
     void ready_to_run_remote(TaskMeta* meta, bool nosignal = false);
     void flush_nosignal_tasks_remote_locked(butil::Mutex& locked_mutex);
     void flush_nosignal_tasks_remote();
 
-    // Automatically decide the caller is remote or local, and call
-    // the corresponding function.
+    // 自动根据 tls_task_group 是否是自己, 选择投递不同的任务队列
     void ready_to_run_general(TaskMeta* meta, bool nosignal = false);
     void flush_nosignal_tasks_general();
 
@@ -199,6 +206,8 @@ public:
     TaskControl* control() const { return _control; }
 
     // Call this instead of delete.
+    // 通过 timer 延迟删除, 因为 steal_task 在遍历其他 group 时, 没持有 _modify_group_mutex,
+    // 因此另一个 worker 可能还持有刚被移出数组的 group 指针
     void destroy_self();
 
     // Wake up blocking ops in the thread.
@@ -275,9 +284,9 @@ friend class TaskControl;
     private:
         // The higher bit for task type, main task is 1, otherwise 0.
         // Lowest 63 bits for last scheduling time.
-        int64_t _last_run_ns_and_type;
+        int64_t _last_run_ns_and_type; // 最近一次调度时间 + 当前是否是 main_task
         // Cumulated CPU time in nanoseconds.
-        int64_t _cumulated_cputime_ns;
+        int64_t _cumulated_cputime_ns; // 累计非 main_task 运行时间, 近似 worker 执行 bthread 的累计时间
     };
 
     class AtomicCPUTimeStat {
@@ -294,7 +303,7 @@ friend class TaskControl;
         }
 
     private:
-        AtomicInteger128 _cpu_time_stat;
+        AtomicInteger128 _cpu_time_stat; // 128-bit 原子快照保证两个 int64_t 同时读取
     };
 
     // You shall use TaskControl::create_group to create new instance.
@@ -342,35 +351,60 @@ friend class TaskControl;
 
     void set_pl(ParkingLot* pl) { _pl = pl; }
 
+    /*
+     * main task 是 worker pthread 原生栈的抽象, 其职责为:
+     * - idle时在 ParkingLot 休眠
+     * - 被唤醒后寻找任务
+     * - 切换到普通 bthread
+     * - 普通 bthread 全部跑完后, 重新回来等待
+    */
     static bool is_main_task(TaskGroup* g, bthread_t tid) {
         return g->_main_tid == tid;
     }
 
-    TaskMeta* _cur_meta{NULL};
+    TaskMeta* _cur_meta{NULL}; // 当前正在此 worker 上运行的 bthread 的信息, 上下文切换时, `sched_to()` 会修改它
     
     // the control that this group belongs to
-    TaskControl* _control{NULL};
-    int _num_nosignal{0};
+    TaskControl* _control{NULL}; // 所属的 global TaskControl
+    int _num_nosignal{0}; // _rq 累积未通知 worker 的任务数
     int _nsignaled{0};
-    AtomicCPUTimeStat _cpu_time_stat;
+    AtomicCPUTimeStat _cpu_time_stat; // 当前运行状态和累积时间统计
     // last thread cpu clock
     int64_t _last_cpu_clock_ns{0};
 
     size_t _nswitch{0};
+    /*
+     * bthread 切换完成后需要执行的延迟回调, 有些操作不能在切换前执行, 因为旧的bthread仍然使用自己的栈和上下文, 比如:
+     * - 一个bthread结束需要释放自己的栈, 需要切换到下一个栈, 在下一个任务中释放旧栈
+     * - 把刚刚挂起的旧任务重新放回 rq
+     * - 安装 sleep timer, 处理 priority queue ...
+    */
     RemainedFn _last_context_remained{NULL};
     void* _last_context_remained_arg{NULL};
 
-    ParkingLot* _pl{NULL};
+    ParkingLot* _pl{NULL}; // idle时用来休眠的 ParkingLot
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
     ParkingLot::State _last_pl_state;
 #endif
     size_t _steal_seed{butil::fast_rand()};
     size_t _steal_offset{prime_offset(_steal_seed)};
+    /*
+     * main task           : current_tid == _main_tid && stack == _main_stack;
+     * pthread-mode bthread: current_tid != _main_tid && stack == _main_stack;
+     * stackful bthread.   : current_tid != _main_tid && stack != _main_stack;
+    */
     ContextualStack* _main_stack{NULL};
-    bthread_t _main_tid{INVALID_BTHREAD};
+    // `TaskGroup::init()` 时分配, 当 TaskGroup 没有普通 bthread 可以运行时, 会切回 _main_tid
+    bthread_t _main_tid{INVALID_BTHREAD}; // = make_tid(), 本 worker 原生栈在 bthread 调度体系里的任务身份
+    /*
+     * 本 worker 的本地 work-steadling 就绪队列:
+     * - 当前worker用 push/pop 操作自己的队列
+     * - 其他worker用 steal 从另一端窃取任务
+     * - 本地路径尽量避免加锁
+    */
     WorkStealingQueue<bthread_t> _rq;
-    RemoteTaskQueue _remote_rq;
-    int _remote_num_nosignal{0};
+    RemoteTaskQueue _remote_rq; // 其他线程向本 group 投递任务的线程安全队列
+    int _remote_num_nosignal{0}; // _remote_rq 累积未通知 worker 的任务数
     int _remote_nsignaled{0};
 
     int _sched_recursive_guard{0};
@@ -378,7 +412,7 @@ friend class TaskControl;
     bthread_tag_t _tag{BTHREAD_TAG_DEFAULT};
 
     // Worker thread id.
-    pthread_t _tid{};
+    pthread_t _tid{}; // = pthread_self(), 用于trace, 不参与 bthread 就绪队列和用户态调度
 };
 
 }  // namespace bthread

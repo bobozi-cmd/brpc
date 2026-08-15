@@ -296,12 +296,13 @@ int TaskGroup::init(size_t runqueue_capacity) {
         return -1;
     }
 #endif // BUTIL_USE_ASAN
-
+    // 创建一个 STACK_TYPE_MAIN 的栈容器
     ContextualStack* stk = get_stack(STACK_TYPE_MAIN, NULL);
     if (NULL == stk) {
         LOG(FATAL) << "Fail to get main stack container";
         return -1;
     }
+    // 分配一个 TaskMeta, 设置 stk 
     butil::ResourceId<TaskMeta> slot;
     TaskMeta* m = butil::get_resource<TaskMeta>(&slot);
     if (NULL == m) {
@@ -327,7 +328,7 @@ int TaskGroup::init(size_t runqueue_capacity) {
     // No guard size required for ASan.
 #endif // BUTIL_USE_ASAN
 
-    _cur_meta = m;
+    _cur_meta = m; // 设置为 _cur_meta, 保存为 _main_tid & _main_stack
     _main_tid = m->tid;
     _main_stack = stk;
 
@@ -502,6 +503,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     const int64_t start_ns = butil::cpuwide_time_ns();
     const bthread_attr_t using_attr = (attr ? *attr : BTHREAD_ATTR_NORMAL);
     butil::ResourceId<TaskMeta> slot;
+    // 创建并初始化新任务的 TaskMeta
     TaskMeta* m = butil::get_resource(&slot);
     if (BAIDU_UNLIKELY(NULL == m)) {
         return ENOMEM;
@@ -538,7 +540,7 @@ int TaskGroup::start_foreground(TaskGroup** pg,
     g->_control->_task_tracer.set_status(TASK_STATUS_CREATED, m);
 #endif // BRPC_BTHREAD_TRACER
     if (g->is_current_pthread_task()) {
-        // never create foreground task in pthread.
+        // 把新任务放入 _rq 等待调度
         g->ready_to_run(m, using_attr.flags & BTHREAD_NOSIGNAL);
     } else {
         // NOSIGNAL affects current task, not the new task.
@@ -554,12 +556,19 @@ int TaskGroup::start_foreground(TaskGroup** pg,
         ReadyToRunArgs args = {
             g->tag(), g->_cur_meta, (bool)(using_attr.flags & BTHREAD_NOSIGNAL)
         };
+        // 设置当前任务为 切换后重新入队
         g->set_remained(fn, &args);
+        // 立即切换到新任务执行
         sched_to(pg, m->tid);
     }
     return 0;
 }
 
+/*
+ * 将 background 任务放入 rq, 不会立即抢占当前 bthread.
+ * REMOTE = false: _rq;
+ * REMOTE = true : _remote_rq
+*/
 template <bool REMOTE>
 int TaskGroup::start_background(bthread_t* __restrict th,
                                 const bthread_attr_t* __restrict attr,
@@ -624,6 +633,7 @@ TaskGroup::start_background<false>(bthread_t* __restrict th,
                                    void * (*fn)(void*),
                                    void* __restrict arg);
 
+// 等待 version_butex 改变, 任务结束时 version++
 int TaskGroup::join(bthread_t tid, void** return_value) {
     if (__builtin_expect(!tid, 0)) {  // tid of bthread is never 0.
         return EINVAL;
@@ -718,6 +728,12 @@ void TaskGroup::ending_sched(TaskGroup** pg) {
     sched_to(pg, next_meta);
 }
 
+/*
+ * 选择任务进行调度, 没有任务就切换回 _main_tid, 顺序如下:
+ * - 从 pg 的 _rq 中 pop
+ * - 从 pg 的 _remote_rq 中 pop
+ * - 通过 TaskControl 先 steal 优先级队列里的任务, 然后从其他的 TaskGroup 里面 steal
+*/ 
 void TaskGroup::sched(TaskGroup** pg) {
     TaskGroup* g = *pg;
     bthread_t next_tid = 0;
@@ -744,7 +760,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                    << ") call sched_to(" << g << ")";
     }
 #endif
-    // Save errno so that errno is bthread-specific.
+    // 保存当前 bthread errno 和 tls 状态
     int saved_errno = errno;
     void* saved_unique_user_ptr = tls_unique_user_ptr;
 
@@ -752,7 +768,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     int64_t now = butil::cpuwide_time_ns();
     CPUTimeStat cpu_time_stat = g->_cpu_time_stat.load_unsafe();
     int64_t elp_ns = now - cpu_time_stat.last_run_ns();
-    cur_meta->stat.cputime_ns += elp_ns;
+    cur_meta->stat.cputime_ns += elp_ns; // 切换任务前, 计算当前任务运行时间
     // Update cpu_time_stat.
     cpu_time_stat.set_last_run_ns(now, is_main_task(g, next_meta->tid));
     cpu_time_stat.add_cumulated_cputime_ns(elp_ns, is_main_task(g, cur_meta->tid));
@@ -773,7 +789,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     // Switch to the task
     if (__builtin_expect(next_meta != cur_meta, 1)) {
         g->_cur_meta = next_meta;
-        // Switch tls_bls
+        // 真正使用的是 pthread TLS, 但是调度器回在切换时保存和恢复, 使其表现为 bthread LTS
         cur_meta->local_storage = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_bls);
         BAIDU_SET_VOLATILE_THREAD_LOCAL(tls_bls, next_meta->local_storage);
 
@@ -786,6 +802,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
         }
 
         if (cur_meta->stack != NULL) {
+            // 如果两个任务使用不同栈, 则切换 stack
             if (next_meta->stack != cur_meta->stack) {
                 CheckBthreadScheSafety();
 #ifdef BRPC_BTHREAD_TRACER
@@ -794,9 +811,11 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
 #endif // BRPC_BTHREAD_TRACER
                 {
                     BTHREAD_SCOPED_ASAN_FIBER_SWITCHER(next_meta->stack->storage);
+                    // bthread A 切换成 B
                     jump_stack(cur_meta->stack, next_meta->stack);
+                    // CPU 重新调度 A
                 }
-                // probably went to another group, need to assign g again.
+                // 重新读取TLS的 TaskGroup, 如果 A 被其他 TaskGroup 窃取, 则需要更新 pg
                 g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
 #ifdef BRPC_BTHREAD_TRACER
                 TaskTracer::set_running_status(g->tid(), g->_cur_meta);
@@ -820,6 +839,9 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
         LOG(FATAL) << "bthread=" << g->current_tid() << " sched_to itself!";
     }
 
+    /*
+     * 切换完成, 执行 remained 回调
+    */
     while (g->_last_context_remained) {
         RemainedFn fn = g->_last_context_remained;
         g->_last_context_remained = NULL;
@@ -872,6 +894,10 @@ void TaskGroup::flush_nosignal_tasks() {
     }
 }
 
+/*
+ * 当普通pthread, 定时器线程等非当前 worker 的线程, 向这个 TaskGroup 投递任务时,
+ * 不能安全地直接操作 _rq, 因此需要放进 _remote_rq
+ */
 void TaskGroup::ready_to_run_remote(TaskMeta* meta, bool nosignal) {
 #ifdef BRPC_BTHREAD_TRACER
     _control->_task_tracer.set_status(TASK_STATUS_READY, meta);
@@ -970,6 +996,7 @@ void TaskGroup::_add_sleep_event(void* void_args) {
     g->_control->_task_tracer.set_status(TASK_STATUS_SUSPENDED, e.meta);
 #endif // BRPC_BTHREAD_TRACER
 
+    // 定时达到后, 将任务重新投递到 rq
     TimerThread::TaskId sleep_id;
     sleep_id = get_global_timer_thread()->schedule(
         ready_to_run_from_timer_thread, void_args,
@@ -1016,6 +1043,7 @@ int TaskGroup::usleep(TaskGroup** pg, uint64_t timeout_us) {
     // We have to schedule timer after we switched to next bthread otherwise
     // the timer may wake up(jump to) current still-running context.
     SleepArgs e = { timeout_us, g->current_tid(), g->current_task(), g };
+    // 切换到其他任务后, 再向全局 timer thread 注册定时事件, 防止 timer 立即触发, 把还没挂起的任务重新加入 rq
     g->set_remained(_add_sleep_event, &e);
     sched(pg);
     g = *pg;
@@ -1118,6 +1146,7 @@ int TaskGroup::interrupt(bthread_t tid, TaskControl* c, bthread_tag_t tag) {
     return 0;
 }
 
+// 把当前任务设置为切换后重新入队, 调用 sched() 执行其他任务
 void TaskGroup::yield(TaskGroup** pg) {
     TaskGroup* g = *pg;
     ReadyToRunArgs args = { g->tag(), g->_cur_meta, false };

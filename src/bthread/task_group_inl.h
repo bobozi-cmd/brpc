@@ -36,7 +36,7 @@ inline butil::ResourceId<TaskMeta> get_slot(bthread_t tid) {
 inline uint32_t get_version(bthread_t tid) {
     return (uint32_t)((tid >> 32) & 0xFFFFFFFFul);
 }
-
+// 只按 tid slot返回地址, 不检查 version
 inline TaskMeta* TaskGroup::address_meta(bthread_t tid) {
     // TaskMeta * m = address_resource<TaskMeta>(get_slot(tid));
     // if (m != NULL && m->version == get_version(tid)) {
@@ -62,6 +62,7 @@ inline void TaskGroup::exchange(TaskGroup** pg, TaskMeta* next_meta) {
 inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
     TaskMeta* next_meta = address_meta(next_tid);
     if (next_meta->stack == NULL) {
+        // 创建 TaskMeta 时并不会立即分配 stack, 等第一次真正调度这个任务时才会 get_stack 创建
 #ifdef BUTIL_USE_ASAN
         ContextualStack* stk = get_stack(next_meta->stack_type(), asan_task_runner);
 #else

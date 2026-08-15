@@ -31,6 +31,8 @@ namespace bthread {
 DECLARE_bool(parking_lot_no_signal_when_no_waiter);
 
 // Park idle workers.
+
+// worker 没任务时的休眠/唤醒机制
 class BAIDU_CACHELINE_ALIGNMENT ParkingLot {
 public:
     class State {

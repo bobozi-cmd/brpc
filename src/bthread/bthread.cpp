@@ -355,6 +355,10 @@ int bthread_start_background(bthread_t* __restrict tid,
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
+/*
+ * 任务入队后需要调用 _control->signal_task(...) 唤醒 ParkingLot 中的 worker, 
+ * 批量创建任务时, 通过BTHREAD_NOSIGNAL 只入队、不立即发信号, 最后调用 bthread_flush 一次性通知 workers
+ */
 void bthread_flush() {
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (g) {

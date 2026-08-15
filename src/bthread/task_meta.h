@@ -33,9 +33,9 @@
 namespace bthread {
 
 struct TaskStatistics {
-    int64_t cputime_ns;
+    int64_t cputime_ns; // 任务被调度运行期间经过的时间
     int64_t nswitch;
-    int64_t cpu_usage_ns;
+    int64_t cpu_usage_ns; // 通过线程CPU clock统计的实际CPU消耗
 };
 
 class KeyTable;
@@ -64,6 +64,9 @@ enum TaskStatus {
     TASK_STATUS_END,
 };
 
+/* 一个具体 bthread 的描述信息: 
+ * bthread id & 用户函数 & 参数 & 栈 & 创建属性 & 状态 & local-storage & 统计信息 & ...
+*/ 
 struct TaskMeta {
     // [Not Reset]
     butil::atomic<ButexWaiter*> current_waiter{NULL};

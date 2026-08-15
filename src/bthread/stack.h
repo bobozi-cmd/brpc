@@ -61,6 +61,7 @@ enum StackType {
     STACK_TYPE_LARGE = BTHREAD_STACKTYPE_LARGE
 };
 
+// bthread 的用户态栈和上下文
 struct ContextualStack {
     virtual ~ContextualStack() = default;
     bthread_fcontext_t context;
@@ -73,8 +74,11 @@ struct ContextualStack {
 ContextualStack* get_stack(StackType type, void (*entry)(intptr_t));
 // Recycle a stack. NULL does nothing.
 void return_stack(ContextualStack*);
-// Jump from stack `from' to stack `to'. `from' must be the stack of callsite
-// (to save contexts before jumping)
+/*
+ * 保存当前寄存器和栈位置, 恢复目标任务的寄存器和栈:
+ * bthread A 调用 jump_stack() -> cpu 执行 B, 此时 A 会停在 jump_stack();
+ * 某个时间点, CPU 开始调度 A, jump_stack() 在 A 的栈上返回
+*/ 
 void jump_stack(ContextualStack* from, ContextualStack* to);
 
 }  // namespace bthread

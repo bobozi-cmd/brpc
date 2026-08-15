@@ -86,6 +86,7 @@ struct WorkerThreadArgs {
     bthread_tag_t tag;
 };
 
+// worker 启动时, 创建自己的 thread-local TaskGroup, 进入 `run_main_task()`
 void* TaskControl::worker_thread(void* arg) {
     run_worker_startfn();
 #ifdef BAIDU_INTERNAL
@@ -97,7 +98,7 @@ void* TaskControl::worker_thread(void* arg) {
     auto tag = dummy->tag;
     delete dummy;
     run_tagged_worker_startfn(tag);
-
+    // 创建 worker 自己的 TaskGroup
     TaskGroup* g = c->create_group(tag);
     TaskStatistics stat;
     if (NULL == g) {
@@ -119,10 +120,10 @@ void* TaskControl::worker_thread(void* arg) {
     }
     BT_VLOG << "Created worker=" << pthread_self() << " tid=" << g->_tid
             << " bthread=" << g->main_tid() << " tag=" << g->tag();
-    tls_task_group = g;
+    tls_task_group = g; // 写入 thread-local TaskGroup
     c->_nworkers << 1;
     c->tag_nworkers(g->tag()) << 1;
-
+    // 进入 main-loop
     g->run_main_task();
 
     stat = g->main_stat();
@@ -525,6 +526,7 @@ int TaskControl::_destroy_group(TaskGroup* g) {
     return 0;
 }
 
+// 通过随机 seed 和质数 offset 遍历其他 TaskGroup, 避免所有 worker 按相同顺序争抢相同队列
 bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     auto tag = tls_task_group->tag();
 

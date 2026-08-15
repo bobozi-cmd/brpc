@@ -28,6 +28,7 @@
 #include "butil/logging.h"                      // CHECK
 #endif
 
+// `| 32-bit Version | 32-bit ResourcePool slot |`, 见 make_tid(), 任务结束, slot 可以被复用, 版本号++
 typedef uint64_t bthread_t;
 
 // tid returned by bthread_start_* never equals this value.

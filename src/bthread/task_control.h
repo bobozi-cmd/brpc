@@ -43,6 +43,8 @@ namespace bthread {
 class TaskGroup;
 
 // Control all task groups
+
+// 全局调度控制器, 管理所有 worker 和 TaskGroup
 class TaskControl {
 friend class TaskGroup;
 friend void wait_for_butex(void*);
