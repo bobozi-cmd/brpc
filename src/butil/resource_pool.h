@@ -63,6 +63,7 @@ namespace butil {
 template <typename T> struct ResourcePoolBlockMaxSize {
     static const size_t value = 64 * 1024; // bytes
 };
+// 小对象可能先达到 ResourcePoolBlockMaxItem 上限
 template <typename T> struct ResourcePoolBlockMaxItem {
     static const size_t value = 256;
 };
@@ -104,7 +105,8 @@ inline T* get_resource(ResourceId<T>* id, Args&&... args) {
 // not-yet-allocated or already-returned id otherwise behavior is undefined.
 // Returns 0 when successful, -1 otherwise.
 template <typename T> inline int return_resource(ResourceId<T> id) {
-    return ResourcePool<T>::singleton()->return_resource(id);
+    // 允许 thread B 归还 A 申请到资源, 意味着跨线程归还到资源不会立即被原申请线程看到, 但是能避免每次归还都竞争锁
+    return ResourcePool<T>::singleton()->return_resource(id); // 返回 -1 表示归还的 id没有成功进入 global 池
 }
 
 // Get the object associated with the identifier |id|.
@@ -115,6 +117,7 @@ template <typename T> inline int return_resource(ResourceId<T> id) {
 //       return_resource<T>/address<T>, even if the identifier is valid,
 //       may race with another thread calling clear_resources<T>.
 template <typename T> inline T* address_resource(ResourceId<T> id) {
+    // ID 不代表所有权, 也不防ABA, 线程 A 可能会看到线程 B 正在使用的对象, 需要上层检查
     return ResourcePool<T>::address_resource(id);
 }
 

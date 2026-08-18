@@ -43,7 +43,13 @@
 #endif
 
 namespace butil {
-    
+
+// uint64_t id = block_index * BLOCK_NITEM + offset_in_block;
+// - block_index = id / BLOCK_NITEM;
+// - offset_in_block = id % BLOCK_NITEM;
+// - group_index = block_index >> 16;
+// - block_index_in_group = block_index & 0xffff;
+// 最终地址: `_block_groups[group_index]->blocks[block_index_in_group]->items[offset]`
 template <typename T>
 struct ResourceId {
     uint64_t value;
@@ -68,17 +74,17 @@ struct ResourcePoolFreeChunk {
 template <typename T> 
 struct ResourcePoolFreeChunk<T, 0> {
     size_t nfree;
-    ResourceId<T> ids[0];
+    ResourceId<T> ids[0]; // 可变长尾部数组
 };
 
 struct ResourcePoolInfo {
-    size_t local_pool_num;
-    size_t block_group_num;
+    size_t local_pool_num; // 当前存在的线程 LocalPool 数量, _nlocal
+    size_t block_group_num; // 已创建的 BlockGroup 数, _ngroup
     size_t block_num;
-    size_t item_num;
+    size_t item_num; // 成功构造过的对象总数，包括空闲和使用中
     size_t block_item_num;
     size_t free_chunk_item_num;
-    size_t total_size;
+    size_t total_size; // block_num * block_item_num * sizeof(T)
 #ifdef BUTIL_RESOURCE_POOL_NEED_FREE_ITEM_NUM
     size_t free_item_num;
 #endif
@@ -105,18 +111,19 @@ public:
     static const size_t BLOCK_NITEM = ResourcePoolBlockItemNum<T>::value;
     static const size_t FREE_CHUNK_NITEM = BLOCK_NITEM;
 
-    // Free identifiers are batched in a FreeChunk before they're added to
-    // global list(_free_chunks).
+    // thread-local 的固定容量数组
     typedef ResourcePoolFreeChunk<T, FREE_CHUNK_NITEM>      FreeChunk;
     typedef ResourcePoolFreeChunk<T, 0> DynamicFreeChunk;
 
+    // 大小容纳一个T, 地址满足 alignof(T), 尚未构造成 T 的原始字节区域
     typedef AlignedMemory<sizeof(T), __alignof__(T)> BlockItem;
     // When a thread needs memory, it allocates a Block. To improve locality,
     // items in the Block are only used by the thread.
     // To support cache-aligned objects, align Block.items by cacheline.
     struct BAIDU_CACHELINE_ALIGNMENT Block {
+        // BlockItem 在第一次使用 slot 时, 通过 placement new 构造
         BlockItem items[BLOCK_NITEM];
-        size_t nitem;
+        size_t nitem; // 该 Block 中已经成功构造了多少个对象
 
         Block() : nitem(0) {}
     };
@@ -137,7 +144,7 @@ public:
     };
 
 
-    // Each thread has an instance of this class.
+    // 每个线程一个 LocalPool
     class BAIDU_CACHELINE_ALIGNMENT LocalPool {
     public:
         explicit LocalPool(ResourcePool* pool)
@@ -150,6 +157,7 @@ public:
         ~LocalPool() {
             // Add to global _free_chunks if there're some free resources
             if (_cur_free.nfree) {
+                // 把local 空闲的 ID 推入 global _free_chunks
                 _pool->push_free_chunk(_cur_free);
             }
 
@@ -166,6 +174,7 @@ public:
         // we don't want.
 #define BAIDU_RESOURCE_POOL_GET(CTOR_ARGS)                                  \
         /* Fetch local free id */                                           \
+        /* 申请线程本地空闲 ID, 不加锁, 不申请内存, 不调构造函数, 类似本地 LiFO */   \
         if (_cur_free.nfree) {                                              \
             const ResourceId<T> free_id = _cur_free.ids[--_cur_free.nfree]; \
             *id = free_id;                                                  \
@@ -175,6 +184,7 @@ public:
         /* Fetch a FreeChunk from global.                                   \
            TODO: Popping from _free needs to copy a FreeChunk which is      \
            costly, but hardly impacts amortized performance. */             \
+        /* 从全局 _free_chunks 取出一个批次, 加锁, 一次获取一批 ID */             \
         if (_pool->pop_free_chunk(_cur_free)) {                             \
             --_cur_free.nfree;                                              \
             const ResourceId<T> free_id =  _cur_free.ids[_cur_free.nfree];  \
@@ -182,6 +192,7 @@ public:
             BAIDU_RESOURCE_POOL_FREE_ITEM_NUM_SUB1;                         \
             return unsafe_address_resource(free_id);                        \
         }                                                                   \
+        /* 没有可以复用的ID, 检查当前线程的 _cur_block, 构造T */                 \
         T* p = NULL;                                                        \
         /* Fetch memory from local block */                                 \
         if (_cur_block && _cur_block->nitem < BLOCK_NITEM) {                \
@@ -189,6 +200,7 @@ public:
             auto item = _cur_block->items + _cur_block->nitem;              \
             p = new (item->void_data()) T CTOR_ARGS;                        \
             if (!ResourcePoolValidator<T>::validate(p)) {                   \
+                /* 只验证新构造的对象, 复用空闲对象时不再验证 */                   \
                 p->~T();                                                    \
                 return NULL;                                                \
             }                                                               \
@@ -222,6 +234,7 @@ public:
 
 #undef BAIDU_RESOURCE_POOL_GET
 
+        // 不析构, 不clear, 只是把id放到local _cur_free, 本地chunk满了归还到 global _free_chunks
         inline int return_resource(ResourceId<T> id) {
             // Return to local free list
             if (_cur_free.nfree < ResourcePool::free_chunk_nitem()) {
@@ -277,6 +290,8 @@ public:
         return NULL;
     }
 
+    // 构造参数只对 新slot 有效, 复用slot时, 复用的是旧 slot 的参数, 所以 The object should be cleared before usage.
+    // brpc 通过 id + version 做标识, 复用时通过 OnCreated() 初始化状态
     template<typename... Args>
     inline T* get_resource(ResourceId<T>* id, Args&&... args) {
         LocalPool* lp = get_or_new_local_pool();
@@ -398,11 +413,13 @@ private:
         do {
             ngroup = _ngroup.load(butil::memory_order_acquire);
             if (ngroup >= 1) {
+                // 在最后一个 BlockGroup 中预留索引
                 BlockGroup* const g =
                     _block_groups[ngroup - 1].load(butil::memory_order_consume);
                 const size_t block_index =
                     g->nblock.fetch_add(1, butil::memory_order_relaxed);
                 if (block_index < RP_GROUP_NBLOCK) {
+                    // 发布 block 指针
                     g->blocks[block_index].store(
                         new_block, butil::memory_order_release);
                     *index = (ngroup - 1) * RP_GROUP_NBLOCK + block_index;
@@ -410,7 +427,7 @@ private:
                 }
                 g->nblock.fetch_sub(1, butil::memory_order_relaxed);
             }
-        } while (add_block_group(ngroup));
+        } while (add_block_group(ngroup)); // 如果当前 BlockGroup 已满, 则申请新的
 
         // Fail to add_block_group.
         delete new_block;
@@ -421,7 +438,7 @@ private:
     // Shall be called infrequently because a BlockGroup is pretty big.
     static bool add_block_group(size_t old_ngroup) {
         BlockGroup* bg = NULL;
-        BAIDU_SCOPED_LOCK(_block_group_mutex);
+        BAIDU_SCOPED_LOCK(_block_group_mutex); // 串行创建 BlockGroup, 因为频率低
         const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
         if (ngroup != old_ngroup) {
             // Other thread got lock and added group before this thread.
@@ -445,13 +462,14 @@ private:
         if (lp != NULL) {
             return lp;
         }
+        // 创建 & 初始化 _local_pool
         lp = new(std::nothrow) LocalPool(this);
         if (NULL == lp) {
             return NULL;
         }
         BAIDU_SCOPED_LOCK(_change_thread_mutex); //avoid race with clear()
 	    BAIDU_SET_VOLATILE_THREAD_LOCAL(_local_pool, lp);
-        butil::thread_atexit(LocalPool::delete_local_pool, lp);
+        butil::thread_atexit(LocalPool::delete_local_pool, lp); // 线程退出时删除 _local_pool
         _nlocal.fetch_add(1, butil::memory_order_relaxed);
         return lp;
     }
@@ -518,26 +536,32 @@ private:
         }
         pthread_mutex_lock(&_free_chunks_mutex);
         if (_free_chunks.empty()) {
+            // 加锁之后 double-check, 防止在 use-after-free 的情况
             pthread_mutex_unlock(&_free_chunks_mutex);
             return false;
         }
+        // 从尾部 LIFO 取出 DynamicFreeChunk, 里面是一组 Chunk
         DynamicFreeChunk* p = _free_chunks.back();
         _free_chunks.pop_back();
-        pthread_mutex_unlock(&_free_chunks_mutex);
+        pthread_mutex_unlock(&_free_chunks_mutex); // 此时 p 被线程独占, 可以尽早释放锁
+        // 把 chunks 复制到 thread-local chunk (通常是 _cur_free)
         c.nfree = p->nfree;
         memcpy(c.ids, p->ids, sizeof(*p->ids) * p->nfree);
-        free(p);
+        free(p); // 释放 ID 列表, 对应 T 对象存在 ResourcePool 的 Block 中
         return true;
     }
 
     bool push_free_chunk(const FreeChunk& c) {
+        // 按实际 ID 数量申请可变长内存(所以用malloc), 头部大小 + ID 数组大小
         DynamicFreeChunk* p = (DynamicFreeChunk*)malloc(
             offsetof(DynamicFreeChunk, ids) + sizeof(*c.ids) * c.nfree);
         if (!p) {
             return false;
         }
+        // 填充动态 Chunk
         p->nfree = c.nfree;
         memcpy(p->ids, c.ids, sizeof(*c.ids) * c.nfree);
+        // 加锁发布到全局列表
         pthread_mutex_lock(&_free_chunks_mutex);
         _free_chunks.push_back(p);
         pthread_mutex_unlock(&_free_chunks_mutex);
@@ -547,12 +571,19 @@ private:
     static butil::static_atomic<ResourcePool*> _singleton;
     static pthread_mutex_t _singleton_mutex;
     STATIC_MEMBER_BAIDU_VOLATILE_THREAD_LOCAL(LocalPool*, _local_pool);
-    static butil::static_atomic<long> _nlocal;
+    static butil::static_atomic<long> _nlocal; // local pool 的数量
     static butil::static_atomic<size_t> _ngroup;
     static pthread_mutex_t _block_group_mutex;
     static pthread_mutex_t _change_thread_mutex;
     static butil::static_atomic<BlockGroup*> _block_groups[RP_MAX_BLOCK_NGROUP];
 
+    /*
+     * 全局空闲 chunk 池:
+     * _free_chunks
+     *  ├── DynamicFreeChunk -> [nfree][id0][id1]...
+     *  ├── DynamicFreeChunk -> [nfree][id0][id1]...
+     *  └── ...
+    */
     std::vector<DynamicFreeChunk*> _free_chunks;
     pthread_mutex_t _free_chunks_mutex;
 
@@ -566,6 +597,7 @@ private:
 template <typename T>
 const size_t ResourcePool<T>::FREE_CHUNK_NITEM;
 
+// 对于每一个 T 都有一个 thread-local 的 _local_pool
 template <typename T>
 BAIDU_THREAD_LOCAL typename ResourcePool<T>::LocalPool*
 ResourcePool<T>::_local_pool = NULL;

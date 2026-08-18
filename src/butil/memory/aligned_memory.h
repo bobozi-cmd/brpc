@@ -68,6 +68,7 @@ struct AlignedMemory {};
     class AlignedMemory<Size, byte_alignment> {                   \
      public:                                                      \
       DECL_ALIGNED_BUFFER(data_, byte_alignment, Size);           \
+      /* 返回内部"已对齐但尚未构造对象"的原始内存地址 */                 \
       void* void_data() { return static_cast<void*>(data_); }     \
       const void* void_data() const {                             \
         return static_cast<const void*>(data_);                   \
