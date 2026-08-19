@@ -37,7 +37,7 @@ inline bool is_sampling_range_valid(size_t sampling_range) {
 // Containing the context for limiting sampling speed.
 struct CollectorSpeedLimit {
     // [Managed by Collector, don't change!]
-    size_t sampling_range;
+    size_t sampling_range; // 采样概率 sampling_range / COLLECTOR_SAMPLING_BASE(0x4000)
     bool ever_grabbed;
     butil::static_atomic<int> count_before_grabbed;
     int64_t first_sample_us;

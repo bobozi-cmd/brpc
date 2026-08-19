@@ -624,6 +624,7 @@ inline bool remove_pthread_contention_site(const Mutex* mutex,
 }
 
 // Submit the contention along with the callsite('s stacktrace)
+// 提交样本需要带上 sampling_range, 以便进行概率补偿
 void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     tls_inside_lock = true;
     BRPC_SCOPE_EXIT {
@@ -990,7 +991,12 @@ BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
 }
 #endif
 
-// Implement bthread_mutex_t related functions
+/*
+ * `| Status  | locked | contended |  含义               |`
+ * `|    0    |   0    |     0     |  未加锁             |`
+ * `| LOCKED  |   1    |     0     |  已加锁, 暂时无等待者 |` 
+ * `|CONTENDED|   1    |     1     |  已加锁, 有竞争者     |`
+ */
 struct MutexInternal {
     butil::static_atomic<unsigned char> locked;
     butil::static_atomic<unsigned char> contended;
@@ -1038,6 +1044,7 @@ BAIDU_CASSERT(sizeof(unsigned) == sizeof(MutexInternal),
 #define BTHREAD_MUTEX_CHECK_OWNER ((void)0)
 #endif // BRPC_DEBUG_LOCK
 
+// 无竞争加锁只执行一次原子操作
 inline int mutex_trylock_impl(bthread_mutex_t* m) {
     MutexInternal* split = (MutexInternal*)m->butex;
     if (!split->locked.exchange(1, butil::memory_order_acquire)) {
@@ -1049,6 +1056,10 @@ inline int mutex_trylock_impl(bthread_mutex_t* m) {
 
 const int MAX_SPIN_ITER = 4;
 
+/* 有竞争加锁时, 用 butex_wait 挂起, 饥饿缓解策略:
+ * - 第一次等待, 放到队尾, FIFO
+ * - 被唤醒后又竞争失败, 则放回队头
+ */
 inline int mutex_lock_contended_impl(bthread_mutex_t* __restrict m,
                                      const struct timespec* __restrict abstime) {
     BTHREAD_MUTEX_CHECK_OWNER;
@@ -1064,7 +1075,11 @@ inline int mutex_lock_contended_impl(bthread_mutex_t* __restrict m,
     bool queue_lifo = false;
     bool first_wait = true;
     auto whole = (butil::atomic<unsigned>*)m->butex;
+    // 把状态设置为 BTHREAD_MUTEX_CONTENDED, 如果旧状态不为 BTHREAD_MUTEX_LOCKED, 则拿到锁, 退出循环
+    // NOTE: 即使没有其他等待者, 状态仍然保留为 CONTENDED (而不是 LOCKED), 导致解锁时产生一次多余的 wake, 但是简化了并发状态管理
     while (whole->exchange(BTHREAD_MUTEX_CONTENDED) & BTHREAD_MUTEX_LOCKED) {
+        // 锁被占用就等待, 只有当前状态仍然等于 BTHREAD_MUTEX_CONTENDED, 才把当前执行单元放入等待队列 (防止 A 在 whole->exchange() 和 butex_wait() 中间解锁)
+        // 状态发生改变时, butex_wait() 返回-1, errno = EWOULDBLOCK
         if (bthread::butex_wait(whole, BTHREAD_MUTEX_CONTENDED, abstime, queue_lifo) < 0 &&
             errno != EWOULDBLOCK && errno != EINTR/*note*/) {
             // A mutex lock should ignore interruptions in general since
@@ -1188,12 +1203,12 @@ int bthread_mutex_init(bthread_mutex_t* __restrict m,
                        const bthread_mutexattr_t* __restrict attr) {
     bthread::make_contention_site_invalid(&m->csite);
     MUTEX_RESET_OWNER_COMMON(m->owner);
-    m->butex = bthread::butex_create_checked<unsigned>();
+    m->butex = bthread::butex_create_checked<unsigned>(); // 从对象池创建一个 Butex
     if (!m->butex) {
         return ENOMEM;
     }
-    *m->butex = 0;
-    m->enable_csite = NULL == attr ? true : attr->enable_csite;
+    *m->butex = 0; // 初始化状态为 未加锁
+    m->enable_csite = NULL == attr ? true : attr->enable_csite; // 初始化竞争采样和 owner 调试信息
     return 0;
 }
 
@@ -1212,6 +1227,7 @@ int bthread_mutex_lock_contended(bthread_mutex_t* m) {
 
 static int bthread_mutex_lock_impl(bthread_mutex_t* __restrict m,
                                    const struct timespec* __restrict abstime) {
+    // 先尝试 仅通过 exchange 原子变量 (fast-path) 加锁
     if (0 == bthread::mutex_trylock_impl(m)) {
         return 0;
     }
@@ -1219,7 +1235,7 @@ static int bthread_mutex_lock_impl(bthread_mutex_t* __restrict m,
     if (!bthread::g_cp) {
         return bthread::mutex_lock_contended_impl(m, abstime);
     }
-    // Ask Collector if this (contended) locking should be sampled.
+    // 下面是记录等待耗时采样的逻辑, 只对发生竞争的加锁做自适应随机采样
     const size_t sampling_range =
         m->enable_csite ? bvar::is_collectable(&bthread::g_cp_sl) : bvar::INVALID_SAMPLING_RANGE;
     if (!bvar::is_sampling_range_valid(sampling_range)) { // Don't sample
@@ -1231,7 +1247,7 @@ static int bthread_mutex_lock_impl(bthread_mutex_t* __restrict m,
     // still contending with each other.
     const int rc = bthread::mutex_lock_contended_impl(m, abstime);
     if (!rc) { // Inside lock
-        m->csite.duration_ns = butil::cpuwide_time_ns() - start_ns;
+        m->csite.duration_ns = butil::cpuwide_time_ns() - start_ns; // 记录 从开始竞争到最终拿到锁的等待时间
         m->csite.sampling_range = sampling_range;
     } else if (rc == ETIMEDOUT) {
         // Failed to lock due to ETIMEDOUT, submit the elapse directly.
@@ -1251,6 +1267,7 @@ int bthread_mutex_timedlock(bthread_mutex_t* __restrict m,
     return bthread_mutex_lock_impl(m, abstime);
 }
 
+// 解锁时, 如果有等待者, 就唤醒一个
 int bthread_mutex_unlock(bthread_mutex_t* m) {
     auto whole = (butil::atomic<unsigned>*)m->butex;
     bthread_contention_site_t saved_csite = {0, 0};
@@ -1265,7 +1282,7 @@ int bthread_mutex_unlock(bthread_mutex_t* m) {
     if (prev == BTHREAD_MUTEX_LOCKED) {
         return 0;
     }
-    // Wakeup one waiter
+    // prev == BTHREAD_MUTEX_CONTENDED, 唤醒一个等待者
     if (!is_valid) {
         bthread::butex_wake(whole);
         return 0;
@@ -1274,6 +1291,7 @@ int bthread_mutex_unlock(bthread_mutex_t* m) {
     bthread::butex_wake(whole);
     const int64_t unlock_end_ns = butil::cpuwide_time_ns();
     saved_csite.duration_ns += unlock_end_ns - unlock_start_ns;
+    // 解锁时再把 等锁时间(duration_ns) 和 解锁+butex_wait()时间 合并提交
     bthread::submit_contention(saved_csite, unlock_end_ns);
     return 0;
 }

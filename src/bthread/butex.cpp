@@ -70,39 +70,53 @@ inline bvar::Adder<int64_t>& butex_waiter_count() {
 
 enum WaiterState {
     WAITER_STATE_NONE,
-    WAITER_STATE_READY,
-    WAITER_STATE_TIMEDOUT,
-    WAITER_STATE_UNMATCHEDVALUE,
-    WAITER_STATE_INTERRUPTED,
+    WAITER_STATE_READY, // 已经准备等待，还没有超时或中断
+    WAITER_STATE_TIMEDOUT, // 定时器到期 -> ETIMEDOUT
+    WAITER_STATE_UNMATCHEDVALUE, // 入队前发现 butex 值不再等于期望值 -> EWOULDBLOCK
+    WAITER_STATE_INTERRUPTED, // 被 bthread_interrupt() 中断 -> EINTR
 };
 
 struct Butex;
 
 struct ButexWaiter : public butil::LinkNode<ButexWaiter> {
     // tids of pthreads are 0
-    bthread_t tid;
+    bthread_t tid; // tid == 0, 表示这个是 pthread 类型
 
-    // Erasing node from middle of LinkedList is thread-unsafe, we need
-    // to hold its container's lock.
+    /* 当前 waiter 属于哪一个 Butex 等待队列 (b->waiters), 有三个作用:
+     *  1. 超时/中断时, 定位等待队列;
+     *  2. 支持 butex_requeue();
+     *  3. 处理 wake、timeout、interrupt 之间的并发竞争.
+     * 之所以是 atomic 的, 因为有几种线程可能同时访问它: 
+     *  - 调用 butex_wake() 的线程
+     *  - TimerThread 超时回调
+     *  - 当前线程恢复后的清理逻辑
+     * Note: 链表中删除节点仍然必须持有 `Butex::waiter_lock`, container 原子化本身不能保证链表操作安全
+     */ 
     butil::atomic<Butex*> container;
 };
 
-// non_pthread_task allocates this structure on stack and queue it in
-// Butex::waiters.
+// 这个结构在调用 butex_wait() 的 bthread stack 上创建
 struct ButexBthreadWaiter : public ButexWaiter {
-    TaskMeta* task_meta;
-    TimerThread::TaskId sleep_id;
-    WaiterState waiter_state;
+    TaskMeta* task_meta; // 调度时切换 bthread 任务状态
+    TimerThread::TaskId sleep_id; // 超时定时器的任务 id, 在向全局 TimerThread 注册超时任务时获取的, 可以通过这个id取消定时器
+    WaiterState waiter_state; // 记录 waiter 最终为什么结束等待, butex_wait() 恢复运行后，根据它决定返回结果
+    // 调用 butex_wait() 时传入的期望值, bthread 入队需要通过 remained 切换之后执行, 所以入队时需要再次检查 expected_value, 防止丢失唤醒
     int expected_value;
-    Butex* initial_butex;
-    TaskControl* control;
-    const timespec* abstime;
+    Butex* initial_butex; // 最初准备在哪个 butex 上等待, 而 container 是当前实际位于哪个 butex 队列 (比如发生 butex_requeue())
+    TaskControl* control; // 唤醒时需要通过 control 选择一个合适的 TaskGroup
+    const timespec* abstime; // 绝对超时时间
     bthread_tag_t tag;
 };
 
 // pthread_task or main_task allocates this structure on stack and queue it
 // in Butex::waiters.
 struct ButexPthreadWaiter : public ButexWaiter {
+    /*
+     * 该 pthread waiter 私有的 futex 信号字:
+     *  初始化: PTHREAD_NOT_SIGNALLED;
+     *  pthread 等待: futex_wait_private(&sig, PTHREAD_NOT_SIGNALLED, timeout);
+     *  wake: sig.store(PTHREAD_SIGNALLED, memory_order_release); futex_wake_private(&sig, 1);
+     */
     butil::atomic<int> sig;
 };
 
@@ -110,13 +124,14 @@ typedef butil::LinkedList<ButexWaiter> ButexWaiterList;
 
 enum ButexPthreadSignal { PTHREAD_NOT_SIGNALLED, PTHREAD_SIGNALLED };
 
+// 一个 cacheline 大小的对象
 struct BAIDU_CACHELINE_ALIGNMENT Butex {
     Butex() {}
     ~Butex() {}
 
-    butil::atomic<int> value;
-    ButexWaiterList waiters;
-    FastPthreadMutex waiter_lock;
+    butil::atomic<int> value; // 用户拿到的是 value 地址, 其他 fields 通过 container_of 获取
+    ButexWaiterList waiters; // 等待队列
+    FastPthreadMutex waiter_lock; // 内部锁
 };
 
 BAIDU_CASSERT(offsetof(Butex, value) == 0, offsetof_value_must_0);
@@ -145,6 +160,7 @@ static void wakeup_pthread(ButexPthreadWaiter* pw) {
 
 bool erase_from_butex(ButexWaiter*, bool, WaiterState);
 
+// 通过 futex_wait_private() 阻塞该 pthread, 再通过 futex_wake_private() 唤醒
 int wait_pthread(ButexPthreadWaiter& pw, const timespec* abstime) {
     timespec* ptimeout = NULL;
     timespec timeout;
@@ -302,6 +318,9 @@ inline void run_in_local_task_group(TaskGroup* g, TaskMeta* next_meta, bool nosi
     }
 }
 
+// 唤醒时, 不会直接转交锁, 被唤醒的执行单元还是需要重新抢锁, 此时可能锁被新来的抢到
+// 这种竞争型 mutex 通常会使吞吐更高, 因为新来的任务已经在CPU上运行了, 但是不如 handoff mutex的公平性
+// 所以 mutex_lock_contended_impl() 做了饥饿缓解策略
 int butex_wake(void* arg, bool nosignal) {
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
     ButexWaiter* front = NULL;
@@ -677,7 +696,7 @@ int butex_wait(void* arg, int expected_value, const timespec* abstime, bool prep
         return -1;
     }
     TaskGroup* g = tls_task_group;
-    if (NULL == g || g->is_current_pthread_task()) {
+    if (NULL == g || g->is_current_pthread_task()) { // 如果等待者本身是 pthread
         return butex_wait_from_pthread(g, b, expected_value, abstime, prepend);
     }
     ButexBthreadWaiter bbw;
@@ -713,7 +732,7 @@ int butex_wait(void* arg, int expected_value, const timespec* abstime, bool prep
     bbw.task_meta->current_waiter.store(&bbw, butil::memory_order_release);
     WaitForButexArgs args{ &bbw, prepend };
     g->set_remained(wait_for_butex, &args);
-    TaskGroup::sched(&g);
+    TaskGroup::sched(&g); // 挂起当前bthread, 切换到其他的 bthread 继续运行
 
     // erase_from_butex_and_wakeup (called by TimerThread) is possibly still
     // running and using bbw. The chance is small, just spin until it's done.

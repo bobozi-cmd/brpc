@@ -180,6 +180,15 @@ struct mutex_owner_t {
     uint64_t id;
 };
 
+/*
+ * 用一个 32-bit 原子状态完成无竞争加锁; 出现竞争后, 把等待和唤醒交给 butex,
+ * bthread 等待时只挂起协程, pthread等待时才阻塞内核线程
+ * bthread_mutex_t 
+ *    └── unsigned* butex ──> Butex.value
+ *                              ├── 32 位锁状态
+ *                              ├── bthread/pthread 等待队列
+ *                              └── 等待队列内部锁
+ */
 typedef struct bthread_mutex_t {
 #if defined(__cplusplus)
     bthread_mutex_t()
@@ -189,13 +198,13 @@ typedef struct bthread_mutex_t {
 
     DISALLOW_COPY_AND_ASSIGN(bthread_mutex_t);
 #endif
-    unsigned* butex;
-    bthread_contention_site_t csite;
-    bool enable_csite;
+    unsigned* butex; // 锁的状态, 以及关联的等待队列
+    bthread_contention_site_t csite; // 锁竞争耗时采样
+    bool enable_csite; // 是否开启该 mutex 的竞争采样
     // Note: Owner detection of the mutex comes with average execution
     // slowdown of about 50%, so it is only used for debugging and is
     // only available when the macro `BRPC_DEBUG_LOCK' = 1.
-    mutex_owner_t owner;
+    mutex_owner_t owner; // 调试模式下记录持锁者，用于发现重复加锁
 } bthread_mutex_t;
 
 typedef struct {

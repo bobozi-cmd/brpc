@@ -31,7 +31,7 @@ namespace bvar {
 DEFINE_int32(bvar_collector_max_pending_samples, 1000,
              "Destroy unprocessed samples when they're too many");
 
-DEFINE_int32(bvar_collector_expected_per_second, 1000,
+DEFINE_int32(bvar_collector_expected_per_second, 1000, // 默认每秒 1000 个样本
              "Expected number of samples to be collected per second");
 
 // CAUTION: Don't change this value unless you know exactly what it means.
@@ -71,7 +71,6 @@ private:
     // The thread for calling user's callbacks.
     void dump_thread();
 
-    // Adjust speed_limit if grab_thread collected too many in one round.
     void update_speed_limit(CollectorSpeedLimit* speed_limit,
                             size_t* last_ngrab, size_t cur_ngrab,
                             int64_t interval_us);
@@ -289,7 +288,14 @@ void Collector::wakeup_grab_thread() {
     pthread_mutex_unlock(&_sleep_mutex);
 }
 
-// Adjust speed_limit to match collected samples per second
+/*
+ * 周期性观察实际采样数量, 调整 new_sampling_range:
+ *  - 锁竞争太多 -> 降低 sampling_range, 降低采样概率;
+ *  - 锁竞争较少 -> 提高 sampling_range, 提高采样概率;
+ * 比如每秒出现 10000 次 contention, 目标是收集 1000 次, 那么 
+ *  - rate = 1000 / 10000 = 10%
+ *  - sampling_range ≈ 16384 × 10% ≈ 1638
+ */ 
 void Collector::update_speed_limit(CollectorSpeedLimit* sl,
                                    size_t* last_ngrab, size_t cur_ngrab,
                                    int64_t interval_us) {

@@ -80,7 +80,7 @@
 //    some internal node type.
 
 namespace butil {
-
+// 侵入式链表节点
 template <typename T>
 class LinkNode {
  public:
