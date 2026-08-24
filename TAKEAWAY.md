@@ -32,3 +32,11 @@
         - LocalPool 创建和测试清理协调: _change_thread_mutex
         - Block、BlockGroup 发布: atomic release/consume
     - 不保证 T 自身线程安全, 把对象指针或 ID 交给其他线程时, 调用方仍要建立正确的同步关系
+
+# ExecutionQueue<T>
+- 一个面向 actor/message-passing 场景的 MPSC 队列, 多个生产者并发提交任务, 同一个队列只有一个消费者串行执行, 消费者按需启动, 默认在队列清空之后退出, 并且一次回调可以批量处理多个任务
+- 队列没有容量限制和背压, 生产速度长期高于消费速度时, 内存会持续增长
+- 为什么原子链表最后还能保持FIFO:
+    - 生产者通过 `_head.exchange()` 压栈, 因此刚写入时时 LIFO: `_head -> C -> B -> A`
+    - 消费者已经在处理A, 当他处理到链表尾部时, 调用 `_more_tasks()`, 会把新增部分反转并接到 A 后: `A -> B -> C`, 所以消费顺序仍然是 FIFO
+

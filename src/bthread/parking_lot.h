@@ -32,9 +32,12 @@ DECLARE_bool(parking_lot_no_signal_when_no_waiter);
 
 // Park idle workers.
 
-// worker 没任务时的休眠/唤醒机制
+// worker 找不到任务时安全地睡眠, 新任务到来时唤醒 worker, 并避免"任务已经到来，worker 却刚好睡下"的丢失唤醒问题
 class BAIDU_CACHELINE_ALIGNMENT ParkingLot {
 public:
+    /*
+     * 保存某一时刻 _pending_signal 的快照, 如果之后版本发生变化，就不要基于旧的判断入睡
+     */
     class State {
     public:
         State(): val(0) {}
@@ -52,10 +55,12 @@ public:
     // Wake up at most `num_task' workers.
     // Returns #workers woken up.
     int signal(int num_task) {
+        // 先修改版本, 防止一个准备睡眠的 worker 真正睡下
         _pending_signal.fetch_add((num_task << 1), butil::memory_order_release);
         if (_no_signal_when_no_waiter && _waiter_num.load(butil::memory_order_relaxed) == 0) {
             return 0;
         }
+        // 唤醒 futex waiter, 返回内核实际唤醒的线程数
         return futex_wake_private(&_pending_signal, num_task);
     }
 
@@ -67,6 +72,7 @@ public:
     // Wait for tasks.
     // If the `expected_state' does not match, wait() may finish directly.
     void wait(const State& expected_state) {
+        // 只有版本没变才允许睡眠, 用户态快速检查
         if (get_state().val != expected_state.val) {
             // Fast path, no need to futex_wait.
             return;
@@ -74,6 +80,7 @@ public:
         if (_no_signal_when_no_waiter) {
             _waiter_num.fetch_add(1, butil::memory_order_relaxed);
         }
+        // futex 再次原子比较并等待
         futex_wait_private(&_pending_signal, expected_state.val, NULL);
         if (_no_signal_when_no_waiter) {
             _waiter_num.fetch_sub(1, butil::memory_order_relaxed);
@@ -82,18 +89,26 @@ public:
 
     // Wakeup suspended wait() and make them unwaitable ever. 
     void stop() {
+        // 永久关闭 ParkingLot, 设置最低位S=1
         _pending_signal.fetch_or(1);
+        // 一次性唤醒最多 10000 个等待者, worker 被唤醒之后会检查 _pending_signal 是否stopped, 然后退出 worker-loop
         futex_wake_private(&_pending_signal, 10000);
     }
 
 private:
-    // higher 31 bits for signalling, LSB for stopping.
+    /*
+     * `31                     1 0`
+     * `+----------------------+---+`
+     * `| signal 版本/计数部分   | S |`
+     * `+----------------------+-^-+`
+     * `                         stop 标志, =1表示停止`
+    */
     butil::atomic<int> _pending_signal;
-    butil::atomic<int> _waiter_num;
+    butil::atomic<int> _waiter_num; // 记录可能正在 futex 上等待的 worker 数量, 避免没有等待者时调用 futex_wake
     // Whether to signal when there is no waiter.
     // In busy worker scenarios, signal overhead
     // can be reduced.
-    bool _no_signal_when_no_waiter;
+    bool _no_signal_when_no_waiter; // 开启 _waiter_num 优化
 };
 
 }  // namespace bthread

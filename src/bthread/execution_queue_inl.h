@@ -34,6 +34,11 @@
 
 namespace bthread {
 
+/*
+ * 带版本号的弱引用:
+ * 高32位: 队列版本, 防止slot被复用后, 旧ID错误访问新队列;
+ * 低32位: ResourcePool slot, 用于O(1)找到队列对象;
+ */
 template <typename T>
 struct ExecutionQueueId {
     uint64_t value;
@@ -63,10 +68,10 @@ struct BAIDU_CACHELINE_ALIGNMENT TaskNode {
     ~TaskNode() {}
     int cancel(int64_t expected_version) {
         BAIDU_SCOPED_LOCK(mutex);
-        if (version != expected_version) {
+        if (version != expected_version) { // 节点回对象池时 version++, 防止被错误复用
             return -1;
         }
-        if (status == UNEXECUTED) {
+        if (status == UNEXECUTED) { // 如果任务还未执行, 会改成 EXECUTED, 消费者会跳过此任务
             status = EXECUTED;
             return 0;
         }
@@ -76,6 +81,7 @@ struct BAIDU_CACHELINE_ALIGNMENT TaskNode {
         BAIDU_SCOPED_LOCK(mutex);
         status = EXECUTED;
     }
+    // 原子地把状态从 UNEXECUTED 改为 EXECUTING
     bool peek_to_execute() {
         BAIDU_SCOPED_LOCK(mutex);
         if (status == UNEXECUTED) {
@@ -85,14 +91,17 @@ struct BAIDU_CACHELINE_ALIGNMENT TaskNode {
         return false;
     }
     butil::Mutex mutex;  // to guard version and status
-    int64_t version;
-    uint8_t status;
-    bool stop_task;
-    bool iterated;
+    int64_t version; // 从对象池回收时递增
+    uint8_t status; // UNEXECUTED (-> EXECUTING) -> EXECUTED
+    bool stop_task; // 内部结束哨兵
+    bool iterated; // 表示消费者是否已经扫描过这个节点
     bool high_priority;
-    bool in_place;
+    bool in_place; // 如果入队时, 队列已经活跃, 则in-place不生效
     TaskNode* next;
     ExecutionQueueBase* q;
+    /*
+     * sizeof(T) <= 56: 直接 placement-new 到节点内部, 否则额外使用 malloc(sizeof(T))
+     */
     union {
         char static_task_mem[56];  // Make sizeof TaskNode exactly 128 bytes
         char* dynamic_task_mem;
@@ -228,7 +237,9 @@ private:
 
     // Don't change the order of _head, _versioned_ref and _stopped unless you 
     // see improvement of performance in test
-    BAIDU_CACHELINE_ALIGNMENT butil::atomic<TaskNode*> _head;
+    // 下面几个高 contention 成员单独进行 cacheline 对齐, 减少生产者, 消费者和stop操作之间的false sharing
+    BAIDU_CACHELINE_ALIGNMENT butil::atomic<TaskNode*> _head; // 生产者提交任务的原子入口, 标记当前是否已经有消费者拥有该队列
+    // 高 32 位: queue version, 低 32 位: ref count
     BAIDU_CACHELINE_ALIGNMENT butil::atomic<uint64_t> _versioned_ref;
     BAIDU_CACHELINE_ALIGNMENT butil::atomic<bool> _stopped;
     butil::atomic<int64_t> _high_priority_tasks;
@@ -248,6 +259,9 @@ private:
     TaskNode* _current_head; // Current task head of each execution.
 };
 
+// 类型适配层, 把 TaskIteratorBase 转成 TaskIterator<T>, 知道如何构造/销毁 T, 
+// 把类型安全的用户callback适配成ExecutionQueueBase 使用的无类型函数, 提供 execute(T),
+// 真正保存运行状态的是 ExecutionQueueBase
 template <typename T>
 class ExecutionQueue : public ExecutionQueueBase {
 struct Forbidden {};
@@ -315,10 +329,12 @@ public:
         if (stopped()) {
             return EINVAL;
         }
+        // 从对象池获取 TaskNode
         TaskNode* node = allocate_node();
         if (BAIDU_UNLIKELY(node == NULL)) {
             return ENOMEM;
         }
+        // 在 node 内构造 T
         void* const mem = allocator::allocate(node);
         if (BAIDU_UNLIKELY(!mem)) {
             return_task_node(node);
@@ -330,6 +346,7 @@ public:
         if (options) {
             opt = *options;
         }
+        // 设置优先级, in-place, TaskHandle
         node->high_priority = opt.high_priority;
         node->in_place = opt.in_place_if_possible;
         if (handle) {

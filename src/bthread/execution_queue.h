@@ -55,7 +55,7 @@ protected:
         , _high_priority(high_priority)
         , _should_break(false)
         , _num_iterated(0)
-    { operator++(); }
+    { operator++(); } // 构造时自动执行一次 operator++(), 直接定位第一个可执行节点
     ~TaskIteratorBase();
     void operator++();
     TaskNode* cur_node() const { return _cur_node; }
@@ -128,6 +128,7 @@ struct TaskOptions {
 };
 
 const static TaskOptions TASK_OPTIONS_NORMAL = TaskOptions(false, false);
+// 优先处理, 不会抢占当前正在运行的任务
 const static TaskOptions TASK_OPTIONS_URGENT = TaskOptions(true, false);
 const static TaskOptions TASK_OPTIONS_INPLACE = TaskOptions(false, true);
 

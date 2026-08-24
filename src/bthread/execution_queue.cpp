@@ -79,11 +79,14 @@ void ExecutionQueueBase::start_execute(TaskNode* node) {
     }
     TaskNode* const prev_head = _head.exchange(node, butil::memory_order_release);
     if (prev_head != NULL) {
+        // 说明已经有消费者, 或已经有待执行任务, 此时不会启动第二个消费者, 保证同一个 queue 始终串行执行
         node->next = prev_head;
         return;
     }
-    // Get the right to execute the task, start a bthread to avoid deadlock
-    // or stack overflow
+    /*
+     * 此时生产者将空队列变为非空队列, 它获得了消费权, 按需启动消费者:
+     * 如果 in-place, 则先在当前线程执行, 否则启动一个 background bthread 或唤醒一个 resident pthread 或交给自定义 Executor
+     */
     node->next = NULL;
     node->q = this;
 
@@ -235,6 +238,10 @@ void ExecutionQueueBase::return_task_node(TaskNode* node) {
     get_execq_vars()->running_task_count << -1;
 }
 
+/*
+ * 不会立刻销毁队列, 而是提交一个特殊的 stop_task, 保证所有已经进入提交临界区的任务 -> stop_task
+ * 防止队列对象先销毁、并发提交者随后访问悬空内存
+ */
 void ExecutionQueueBase::_on_recycle() {
     // Push a closed tasks
     while (true) {
@@ -431,14 +438,14 @@ void TaskIteratorBase::operator++() {
         return;
     }
     if (_cur_node->iterated) {
-        _cur_node = _cur_node->next;
+        _cur_node = _cur_node->next; // 移动到下一个节点
     }
-    if (should_break_for_high_priority_tasks()) {
+    if (should_break_for_high_priority_tasks()) { // 检查是否需要让位给高优先级任务
         return;
     }  // else the next high_priority_task would be delayed for at most one task
 
     while (_cur_node && !_cur_node->stop_task) {
-        if (_high_priority == _cur_node->high_priority) {
+        if (_high_priority == _cur_node->high_priority) { // 优先级匹配
             if (!_cur_node->iterated && _cur_node->peek_to_execute()) {
                 ++_num_iterated;
                 _cur_node->iterated = true;
