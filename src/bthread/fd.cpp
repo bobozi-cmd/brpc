@@ -46,6 +46,9 @@ namespace bthread {
 
 extern BAIDU_THREAD_LOCAL TaskGroup* tls_task_group;
 
+/* 
+ * 分块懒分配数组, 先只分配一级索引 _blocks, 某一段 fd 第一次使用时才分配对应的 Block
+ */
 template <typename T, size_t NBLOCK, size_t BLOCK_SIZE>
 class LazyArray {
     struct Block {
@@ -67,6 +70,7 @@ public:
         if (b != NULL) {
             return b->items + block_offset;
         }
+        // 分配一个新 Block
         b = new (std::nothrow) Block;
         if (NULL == b) {
             b = _blocks[block_index].load(butil::memory_order_consume);
@@ -80,10 +84,12 @@ public:
                 butil::memory_order_consume)) {
             return b->items + block_offset;
         }
+        // CAS 失败者删除自己创建的 Block, 使用胜出者的 Block
         delete b;
         return expected->items + block_offset;
     }
 
+    // 只查询, 不分配, 主要供 epoll 事件处理和 bthread_close() 使用
     butil::atomic<T>* get(size_t index) const {
         const size_t block_index = index / BLOCK_SIZE;
         if (__builtin_expect(block_index < NBLOCK, 1)) {
@@ -99,7 +105,7 @@ public:
 private:
     butil::atomic<Block*> _blocks[NBLOCK];
 };
-
+// 每个 fd 对应一个butex, 这是一个版本计数器, 和 ParkingLot 的版本快照思想相同
 typedef butil::atomic<int> EpollButex;
 
 static EpollButex* const CLOSING_GUARD = (EpollButex*)(intptr_t)-1L;
@@ -113,6 +119,9 @@ LazyArray<EpollButex*, 262144/*NBLOCK*/, 256/*BLOCK_SIZE*/> fd_butexes;
 
 static const int BTHREAD_DEFAULT_EPOLL_SIZE = 65536;
 
+/*
+ * 通过 `bthread_start_background()` 创建的一个 bthread, 阻塞在 epoll_wait(), 所以会长期占用一个worker pthread
+ */
 class EpollThread {
 public:
     EpollThread()
@@ -131,6 +140,7 @@ public:
             _start_mutex.unlock();
             return -1;
         }
+        // 创建 epoll fd
 #if defined(OS_LINUX)
         _epfd = epoll_create(epoll_size);
 #elif defined(OS_MACOSX)
@@ -143,6 +153,7 @@ public:
         }
         bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
         bthread_attr_set_name(&attr, "EpollThread::run_this");
+        // 创建后台 bthread
         if (bthread_start_background(
                 &_tid, &attr, EpollThread::run_this, this) != 0) {
             close(_epfd);
@@ -157,6 +168,7 @@ public:
     // since stop_and_join is only called on program's termination
     // (g_task_control.stop()), suspended bthreads do not block quit of
     // worker pthreads and completion of g_task_control.stop().
+    // 另一个线程关闭 epoll fd 不一定能唤醒正在执行的 epoll_wait
     int stop_and_join() {
         if (!started()) {
             return 0;
@@ -172,6 +184,7 @@ public:
         // Visibility of _stop: constant EPOLLOUT forces epoll_wait to see
         // _stop (to be true) finally.
         _stop = true;
+        // 创建一条 pipe, 把写端注册为 EPOLLOUT, 立即触发事件, 使 epoll_wait 看到 _stop = true
         int closing_epoll_pipe[2];
         if (pipe(closing_epoll_pipe)) {
             PLOG(FATAL) << "Fail to create closing_epoll_pipe";
@@ -191,7 +204,7 @@ public:
                         << saved_epfd;
             return -1;
         }
-
+        // 等待 bthread 退出, 关闭 pipe 两端 和 epfd
         const int rc = bthread_join(_tid, NULL);
         if (rc) {
             LOG(FATAL) << "Fail to join EpollThread, " << berror(rc);
@@ -204,12 +217,14 @@ public:
     }
 
     int fd_wait(int fd, unsigned events, const timespec* abstime) {
+        // 找到 fd 对应的 slot
         butil::atomic<EpollButex*>* p = fd_butexes.get_or_new(fd);
         if (NULL == p) {
             errno = ENOMEM;
             return -1;
         }
 
+        // lazy 创建 butex
         EpollButex* butex = p->load(butil::memory_order_consume);
         if (NULL == butex) {
             // It is rare to wait on one file descriptor from multiple threads
@@ -218,6 +233,7 @@ public:
             butex = butex_create_checked<EpollButex>();
             butex->store(0, butil::memory_order_relaxed);
             EpollButex* expected = NULL;
+            // CAS 防止多线程同时创建 butex
             if (!p->compare_exchange_strong(expected, butex,
                                             butil::memory_order_release,
                                             butil::memory_order_consume)) {
@@ -225,8 +241,9 @@ public:
                 butex = expected;
             }
         }
-        
+        // 处理正在关闭的 fd, CLOSING_GUARD 表示这个 fd 正在执行 bthread_close
         while (butex == CLOSING_GUARD) {  // bthread_close() is running.
+            // 让出 CPU, 避免一边注册 fd, 另一边在删除关闭它
             if (sched_yield() < 0) {
                 return -1;
             }
@@ -235,8 +252,9 @@ public:
         // Save value of butex before adding to epoll because the butex may
         // be changed before butex_wait. No memory fence because EPOLL_CTL_MOD
         // and EPOLL_CTL_ADD shall have release fence.
-        const int expected_val = butex->load(butil::memory_order_relaxed);
+        const int expected_val = butex->load(butil::memory_order_relaxed); // 在注册fd之前保存version
 
+        // 注册 event fd
 #if defined(OS_LINUX)
 # ifdef BAIDU_KERNEL_FIXED_EPOLLONESHOT_BUG
         epoll_event evt = { events | EPOLLONESHOT, { butex } };
@@ -266,7 +284,9 @@ public:
             return -1;
         }
 #endif
+        // 等待 butex 版本变化
         while (butex->load(butil::memory_order_relaxed) == expected_val) {
+            // 如果 *butex == expected_val, 才原子挂起当前 bthread
             if (butex_wait(butex, expected_val, abstime) < 0 &&
                 errno != EWOULDBLOCK && errno != EINTR) {
                 return -1;
@@ -275,6 +295,7 @@ public:
         return 0;
     }
 
+    // 只能唤醒等待在 butex 上的 bthread, 不能唤醒走 poll() 的 pthread
     int fd_close(int fd) {
         if (fd < 0) {
             // what close(-1) returns
@@ -283,9 +304,10 @@ public:
         }
         butil::atomic<EpollButex*>* pbutex = bthread::fd_butexes.get(fd);
         if (NULL == pbutex) {
-            // Did not call bthread_fd functions, close directly.
+            // 没有使用过 bthread fd的接口, 直接调用系统 close()
             return close(fd);
         }
+        // 设置关闭哨兵
         EpollButex* butex = pbutex->exchange(
             CLOSING_GUARD, butil::memory_order_relaxed);
         if (butex == CLOSING_GUARD) {
@@ -293,10 +315,13 @@ public:
             errno = EBADF;
             return -1;
         }
+        // 唤醒已有等待者, 此时等待者的 bthread_fd_wait() 可能返回 0
+        // 它只知道发生版本变化, 但是不清楚原因, 后续真正执行 read/write 才会得到相应错误
         if (butex != NULL) {
             butex->fetch_add(1, butil::memory_order_relaxed);
             butex_wake_all(butex);
         }
+        // 从 epoll 中删除并关闭
 #if defined(OS_LINUX)
         epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, NULL);
 #elif defined(OS_MACOSX)
@@ -307,6 +332,11 @@ public:
         kevent(_epfd, &evt, 1, NULL, 0, NULL);
 #endif
         const int rc = close(fd);
+        /*
+         * 恢复旧 butex 而不是销毁它:
+         *  1. 避免已有等待线程引用已释放内存
+         *  2. fd数字被os复用之后, 可以继续复用这个版本计数器
+         */
         pbutex->exchange(butex, butil::memory_order_relaxed);
         return rc;
     }
@@ -322,7 +352,7 @@ private:
 
     void* run() {
         const int initial_epfd = _epfd;
-        const size_t MAX_EVENTS = 32;
+        const size_t MAX_EVENTS = 32; // 每次最多取32个事件
 #if defined(OS_LINUX)
         epoll_event* e = new (std::nothrow) epoll_event[MAX_EVENTS];
 #elif defined(OS_MACOSX)
@@ -386,6 +416,8 @@ private:
 #elif defined(OS_MACOSX)
                 EpollButex* butex = static_cast<EpollButex*>(e[i].udata);
 #endif
+                // 收到事件后唤醒所有等待者, 会发生 惊群, 但是只有一个线程会抢到 I/O 机会
+                // 所以 bthread_fd_wait() 和非阻塞 I/O 应该放到 loop 里多次尝试
                 if (butex != NULL && butex != CLOSING_GUARD) {
                     butex->fetch_add(1, butil::memory_order_relaxed);
                     butex_wake_all(butex);
@@ -399,21 +431,22 @@ private:
         return NULL;
     }
 
-    int _epfd;
-    bool _stop;
-    bthread_t _tid;
-    butil::Mutex _start_mutex;
+    int _epfd; // Linux 上 epoll fd; MacOS 上 kqueue fd
+    bool _stop; // 通知事件循环退出
+    bthread_t _tid; // 专用 epoll bthread 的 id
+    butil::Mutex _start_mutex; // 防止并非重复启动
 };
 
 EpollThread epoll_thread[BTHREAD_EPOLL_THREAD_NUM];
 
 static inline EpollThread& get_epoll_thread(int fd) {
     if (BTHREAD_EPOLL_THREAD_NUM == 1UL) {
+        // 所有 fd 使用同一个 EpollThread
         EpollThread& et = epoll_thread[0];
         et.start(BTHREAD_DEFAULT_EPOLL_SIZE);
         return et;
     }
-
+    // 多实例时, 通过 fd 哈希分配, 避免连续 fd 全部集中到某种简单取模模式
     EpollThread& et = epoll_thread[butil::fmix32(fd) % BTHREAD_EPOLL_THREAD_NUM];
     et.start(BTHREAD_DEFAULT_EPOLL_SIZE);
     return et;
@@ -448,9 +481,11 @@ int bthread_fd_wait(int fd, unsigned events) {
     }
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (NULL != g && !g->is_current_pthread_task()) {
+        // bthread 路径, 不占用当前 worker
         return bthread::get_epoll_thread(fd).fd_wait(
             fd, events, NULL);
     }
+    // pthread 路径, 阻塞该 pthread
     return bthread::pthread_fd_wait(fd, events, NULL);
 }
 
@@ -475,24 +510,27 @@ int bthread_connect(int sockfd, const sockaddr* serv_addr,
                     socklen_t addrlen) {
     bthread::TaskGroup* g = bthread::tls_task_group;
     if (NULL == g || g->is_current_pthread_task()) {
+        // blocking socket 可能阻塞当前 pthread
         return ::connect(sockfd, serv_addr, addrlen);
     }
-
+    // 普通 bthread
     bool is_blocking = butil::is_blocking(sockfd);
     if (is_blocking) {
+        // 为了避免阻塞 worker pthread, 先暂时把 socket 改成 non-blocking
         butil::make_non_blocking(sockfd);
     }
-    // Scoped non-blocking.
+    // 用 guard 保证返回时恢复原状
     auto guard = butil::MakeScopeGuard([is_blocking, sockfd]() {
         if (is_blocking) {
             butil::make_blocking(sockfd);
         }
     });
-
+    // 执行非阻塞连接, EINPROGRESS 表示连接正在异步进行, 0 表示立即连接成功
     const int rc = ::connect(sockfd, serv_addr, addrlen);
     if (rc == 0 || errno != EINPROGRESS) {
         return rc;
     }
+    // 对于 EINPROGRESS, 等待 socket 可写, 此时可能连接成, 也可能异步连接失败
 #if defined(OS_LINUX)
     if (bthread_fd_wait(sockfd, EPOLLOUT) < 0) {
 #elif defined(OS_MACOSX)
@@ -500,7 +538,7 @@ int bthread_connect(int sockfd, const sockaddr* serv_addr,
 #endif
         return -1;
     }
-
+    // 检查socket错误和TCP状态
     if (butil::is_connected(sockfd) != 0) {
         return -1;
     }

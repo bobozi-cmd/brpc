@@ -71,6 +71,7 @@ int is_connected(int sockfd) {
     errno = 0;
     int err;
     socklen_t errlen = sizeof(err);
+    // 读取 SO_ERROR
     if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
         PLOG(FATAL) << "Fail to getsockopt";
         return -1;
@@ -87,6 +88,7 @@ int is_connected(int sockfd) {
         PLOG(FATAL) << "Fail to getsockopt";
         return -1;
     }
+    // 进一步检查 TCP_INFO 是否处于 TCP_ESTABLISHED
     if (ti.tcpi_state != TCP_ESTABLISHED) {
         errno = ENOTCONN;
         return -1;

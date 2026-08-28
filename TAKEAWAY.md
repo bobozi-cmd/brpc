@@ -40,3 +40,19 @@
     - 生产者通过 `_head.exchange()` 压栈, 因此刚写入时时 LIFO: `_head -> C -> B -> A`
     - 消费者已经在处理A, 当他处理到链表尾部时, 调用 `_more_tasks()`, 会把新增部分反转并接到 A 后: `A -> B -> C`, 所以消费顺序仍然是 FIFO
 
+# fd
+- `bthread_fd_wait()` 只等待"可能就绪", 不执行真正的 I/O, 也不保证返回后一定能读写, 应搭配非阻塞 fd 和 EAGAIN 重试循环
+- 使用过 bthread fd 等待后, 应调用 bthread_close(), 否则等待者可能永久挂起
+- 同一个 fd 的事件会唤醒所有等待者, 可能产生惊群
+- 同一个 fd 同时用不同的事件集合等待并不理想, 默认 Linux 路径第二次 EPOLL_CTL_ADD 得到 EEXIST 后不会更新最初注册的事件集合
+- 由于兼容旧内核 epoll one-shot 问题, 默认路径需要频繁执行 EPOLL_CTL_ADD/DEL, 不适合高频、性能关键的事件分发. brpc 自己的高性能 socket 处理通常使用专门的 EventDispatcher
+- 什么是 epoll one-shot?
+    - 普通 epoll 默认采用 "持续监听" 语义, fd 注册之后, 只要它满足就绪条件, epoll_wait() 就可能反复返回该 fd, 而如果注册时加入 `EPOLLONESHOT`:
+        ```
+        evt.events = EPOLLIN | EPOLLONESHOT;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &evt);
+        ```
+    - 那么 epoll 只会通知一次, 然后该 fd 在 epoll 中自动被禁用, 如果想要继续监听, 必须显式重新激活: `epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &evt);`
+    - one-shot 主要用来防止同一个 fd 在事件尚未处理完时, 被重复分发, 比如有多个 epoll 处理线程重复收到事件, 多个线程同时读取同一个 socket, 并发修改状态等, 使用 EPOLLONESHOT 后, 第一次事件返回便自动禁用 fd. 处理者完成后再 MOD 重新启用, 相当于暂时取得这个 fd 的事件处理权
+    - EPOLLONESHOT 表示 epoll 只上报一次，不表示只唤醒一个业务 bthread, 一次 epoll 通知仍然可以通过 butex_wake_all() 唤醒很多 bthread
+    - 和边缘触发 EPOLLET 的区别: EPOLLET 决定"什么时候通知", EPOLLONESHOT 决定"通知一次后是否自动禁用"; 即 EPOLLET 不会禁用 fd, 只是每次触发事件只通知一次
