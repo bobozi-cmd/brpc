@@ -25,7 +25,10 @@
 
 namespace brpc {
 
-// RAII: Call Run() of the closure on destruction.
+/*
+ * 当 ClosureGuard 离开作用域时, 会自动调用 Protobuf Closure 的 Run(),
+ * 保证 RPC 服务无论正常返回还是提前返回, 都不会漏掉 `_done->Run();`
+ */
 class ClosureGuard {
 public:
     ClosureGuard() : _done(NULL) {}
@@ -64,7 +67,12 @@ public:
 private:
     // Copying this object makes no sense.
     DISALLOW_COPY_AND_ASSIGN(ClosureGuard);
-    
+    /*
+     * Protobuf 提供的抽象回调接口, 类似 `std::function<void()>`, 
+     * 提供 Run() 接口, 调用后可能自动删除自身, see src/brpc/callback.h.
+     * FunctionClosure1/2/... 里的参数, 是创建回调时, 提前绑定进去的. 
+     * 因为没有使用可变参数模版, 所以参数数量有限, 参数类型匹配比较严格, 如 std::string 和 const char* 推导时不能兼容, 还不支持引用参数等问题
+     */
     google::protobuf::Closure* _done;
 };
 

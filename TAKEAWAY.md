@@ -56,3 +56,22 @@
     - one-shot 主要用来防止同一个 fd 在事件尚未处理完时, 被重复分发, 比如有多个 epoll 处理线程重复收到事件, 多个线程同时读取同一个 socket, 并发修改状态等, 使用 EPOLLONESHOT 后, 第一次事件返回便自动禁用 fd. 处理者完成后再 MOD 重新启用, 相当于暂时取得这个 fd 的事件处理权
     - EPOLLONESHOT 表示 epoll 只上报一次，不表示只唤醒一个业务 bthread, 一次 epoll 通知仍然可以通过 butex_wake_all() 唤醒很多 bthread
     - 和边缘触发 EPOLLET 的区别: EPOLLET 决定"什么时候通知", EPOLLONESHOT 决定"通知一次后是否自动禁用"; 即 EPOLLET 不会禁用 fd, 只是每次触发事件只通知一次
+
+# Controller
+- 一个 RPC 和一次 Call 的区别:
+    - 一个用户看到的逻辑 RPC, 可能包含多个网络请求: 
+        - 第一次 Call + (重试 Call + (Backup Call))
+        - 内部的 `struct Controller::Call` 表示其中一次实际发送
+- 所有成功、失败、超时、取消、重试和 backup request 最终都汇入 OnVersionedRPCReturned(), 再由 EndRPC() 统一完成资源回收和用户回调
+- 为什么 `IssueRPC()` 需要记录 Call_id?
+    - 因为网络响应可能是乱序的, 例如:
+        1. 第一次请求超时;
+        2. 框架发出重试;
+        3. 第一次请求的迟到响应随后到达
+    - 如果只使用同一个 ID, 旧响应可能被误认为重试响应. 版本化 ID 让 OnVersionedRPCReturned() 能识别并忽略已经过期的结果
+- 普通重试和 backup request 的区别:
+    - 重试: 上一请求已经失败, 之后再发一个
+    - Backup Request: 上一请求可能仍在处理, 只是响应太慢, 于是并发发第二个, 谁先成功就采用谁
+    - 负载均衡时, 失败过的服务器会暂时放入 _accessed, 尽量避免重试时立即选回同一个节点
+
+# IOBuf

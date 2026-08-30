@@ -215,6 +215,60 @@ compile_brpc() {
   build_brpc
 }
 
+compile_example() {
+  local example_name="${1:-}"
+  local example_source_dir
+  local example_build_dir
+  local jobs
+
+  [[ -n "${example_name}" ]] || die "example 后需要提供目录名，例如：./env.sh example echo_c++"
+  case "${example_name}" in
+    .|..|*/*) die "example 目录名必须是 example/ 下的直接子目录：${example_name}" ;;
+  esac
+  shift
+
+  example_source_dir="${WORKSPACE_DIR}/example/${example_name}"
+  example_build_dir="${BUILD_DIR}/examples/${example_name}"
+  [[ -d "${example_source_dir}" ]] || die "找不到 example 目录：${example_source_dir}"
+  [[ -f "${example_source_dir}/CMakeLists.txt" ]] || \
+    die "example 不支持 CMake 编译：${example_source_dir}"
+
+  # example 独立于主工程配置；缺少 bRPC 产物时先编译主工程。
+  if [[ ! -f "${BUILD_DIR}/output/include/brpc/server.h" ||
+        ! -f "${BUILD_DIR}/output/lib/libbrpc.a" ]]; then
+    log "未找到 bRPC 编译产物，先编译主工程"
+    build_brpc
+  else
+    ensure_running
+  fi
+
+  jobs="${DEV_BUILD_JOBS:-$(docker exec "${CONTAINER_NAME}" nproc)}"
+  [[ "${jobs}" =~ ^[1-9][0-9]*$ ]] || die "DEV_BUILD_JOBS 必须是正整数，当前值：${jobs}"
+
+  log "配置 example/${example_name}：${example_build_dir} (${BUILD_TYPE})"
+  docker exec \
+    --workdir "${WORKSPACE_DIR}" \
+    "${CONTAINER_NAME}" \
+    cmake \
+      -S "${example_source_dir}" \
+      -B "${example_build_dir}" \
+      -G Ninja \
+      "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}" \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      "-DBRPC_INCLUDE_PATH=${BUILD_DIR}/output/include" \
+      "-DBRPC_LIB=${BUILD_DIR}/output/lib/libbrpc.a" \
+      "$@"
+
+  log "编译 example/${example_name}（${jobs} 个并行任务）"
+  docker exec \
+    --workdir "${WORKSPACE_DIR}" \
+    "${CONTAINER_NAME}" \
+    cmake --build "${example_build_dir}" --parallel "${jobs}"
+  log "example 编译完成：${example_build_dir}"
+}
+
 show_status() {
   local image_sync="n/a"
 
@@ -246,6 +300,8 @@ usage() {
                       配置 bRPC（默认使用 Ninja 和 ccache）
   compile [CMake 参数]
                       配置并编译 bRPC
+  example <目录名> [CMake 参数]
+                      编译 example/<目录名>，产物放在 build/examples/<目录名>
   status              显示当前配置和运行状态
   down                删除容器，保留源码和 ccache
   help                显示本帮助
@@ -287,6 +343,9 @@ case "${command_name}" in
     ;;
   compile)
     compile_brpc "$@"
+    ;;
+  example)
+    compile_example "$@"
     ;;
   status)
     show_status

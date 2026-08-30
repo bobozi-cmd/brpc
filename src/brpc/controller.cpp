@@ -182,6 +182,7 @@ static void CreateIgnoreAllRead() { s_ignore_all_read = new IgnoreAllRead; }
 // directly and indirectly referenced), do them in this method. Notice that
 // you don't have to set the fields to initial state after deletion since
 // they'll be set uniformly after this method is called.
+// 释放 socket、HTTP header、attachment、stream、timer、sample、span 等资源
 void Controller::ResetNonPods() {
     if (auto span = _span.lock()) {
         Span::Submit(span, butil::cpuwide_time_us());
@@ -236,7 +237,7 @@ void Controller::ResetNonPods() {
 
     CHECK(_unfinished_call == NULL);
 }
-
+// 恢复数值、指针和枚举的初始状态
 void Controller::ResetPods() {
     // NOTE: Make the sequence of assignments same with the order that they're
     // defined in header. Better for cpu cache and faster for lookup.
@@ -493,7 +494,7 @@ void Controller::SetFailed(int error_code, const char* reason_fmt, ...) {
     }
     UpdateResponseHeader(this);
 }
-
+// 不会立即关闭连接, 而是设置 FLAGS_CLOSE_CONNECTION, 告诉后续响应流程不要正常回包并关闭连接
 void Controller::CloseConnection(const char* reason_fmt, ...) {
     if (_error_code == 0) {
         _error_code = ECLOSE;
@@ -522,6 +523,8 @@ void Controller::CloseConnection(const char* reason_fmt, ...) {
     UpdateResponseHeader(this);
 }
 
+// [服务端] 判断客户端连接是否已经断开
+// RPC 到达 deadline 并不必然意味着服务端 IsCanceled() 返回 true
 bool Controller::IsCanceled() const {
     SocketUniquePtr sock;
     return (Socket::Address(_current_call.peer_id, &sock) != 0);
@@ -566,6 +569,7 @@ int Controller::RunOnCancel(bthread_id_t id, void* data, int error_code) {
     return 0;
 }
 
+// [客户端] 注册连接断开回调
 void Controller::NotifyOnCancel(google::protobuf::Closure* callback) {
     if (NULL == callback) {
         LOG(WARNING) << "Parameter `callback' is NLLL";
@@ -602,12 +606,12 @@ static void HandleTimeout(void* arg) {
     bthread_id_t correlation_id = { (uint64_t)arg };
     bthread_id_error(correlation_id, ERPCTIMEDOUT);
 }
-
+// 响应, socket 错误, 定时器事件, 最终都会进入这个函数
 void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
                                         bool new_bthread, int saved_error) {
     // TODO(gejun): Simplify call-ending code.
     // Intercept previous calls
-    while (info.id != _correlation_id && info.id != current_id()) {
+    while (info.id != _correlation_id && info.id != current_id()) { // 检查是不是当前版本
         if (_unfinished_call && get_id(_unfinished_call->nretry) == info.id) {
             if (!FailedInline()) {
                 // Continue with successful backup request.
@@ -660,6 +664,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             }
             _accessed->Add(_current_call.peer_id);
         }
+        // 触发 Backup Request, 保留旧Call, 并发发出新 Call
         // _current_call does not end yet.
         CHECK(_unfinished_call == NULL);  // only one backup request now.
         _unfinished_call = new (std::nothrow) Call(&_current_call);
@@ -671,6 +676,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
         add_flag(FLAGS_BACKUP_REQUEST);
         return IssueRPC(butil::gettimeofday_us());
     } else {
+        // 错误时, 允许重试 -> 清理本次 Call, 选择服务器重新 IssueRPC
         auto retry_policy = _retry_policy ? _retry_policy : DefaultRetryPolicy();
         if (retry_policy->DoRetry(this)) {
             // The error must come from _current_call because:
@@ -686,6 +692,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
                         goto END_OF_RPC;
                     }
                 }
+                // 暂存失败过的服务器, 避免重试时立即选回同一个节点
                 _accessed->Add(_current_call.peer_id);
             }
             _current_call.OnComplete(this, _error_code, info.responded, false);
@@ -881,12 +888,14 @@ void Controller::Call::OnComplete(
 }
 
 void Controller::EndRPC(const CompletionInfo& info) {
+    // 删除超时定时器
     if (_timeout_id != 0) {
         bthread_timer_del(_timeout_id);
         _timeout_id = 0;
     }
 
-    // End _current_call and _unfinished_call.
+    // 结束当前 Call 和未完成的 backup Call
+    // OnComplete() 将结果反馈给负载均衡器和熔断器, 按连接类型归还或关闭 socket
     if (info.id == current_id() || info.id == _correlation_id) {
         if (_current_call.sending_sock != NULL) {
             _remote_side = _current_call.sending_sock->remote_side();
@@ -962,7 +971,7 @@ void Controller::EndRPC(const CompletionInfo& info) {
         }
     }
 
-    // No need to retry or can't retry, just call user's `done'.
+    // 调用异步 _done->Run(), 或唤醒同步等待者, 销毁 correlation ID
     const CallId saved_cid = _correlation_id;
     if (_done) {
         if (!FLAGS_usercode_in_pthread || _done == DoNothing()/*Note*/) {
@@ -980,8 +989,7 @@ void Controller::EndRPC(const CompletionInfo& info) {
             OnRPCEnd(butil::gettimeofday_us());
             const bool destroy_cid_in_done = has_flag(FLAGS_DESTROY_CID_IN_DONE);
             _done->Run();
-            // NOTE: Don't touch this Controller anymore, because it's likely to be
-            // deleted by done.
+            // NOTE: 之后 Controller 可能已经被 done 删除, 不能再访问 Controller
             if (!destroy_cid_in_done) {
                 // Make this thread not scheduling itself when launching new
                 // bthreads, saving signalings.
@@ -1076,7 +1084,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // call_id + N + 1 : retry N
     // All ids except call_id are versioned. Say if we've sent retry 1 and
     // a failed response of first try comes back, it will be ignored.
-    const CallId cid = current_id();
+    const CallId cid = current_id(); // 计算当前 Call 的版本号
 
     // Intercept IssueRPC when _sender is set. Currently _sender is only set
     // by SelectiveChannel.
@@ -1092,6 +1100,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     _current_call.need_feedback = false;
     _current_call.enable_circuit_breaker = has_enabled_circuit_breaker();
     SocketUniquePtr tmp_sock;
+    // 根据单服务配置或负载均衡器来选择目标
     if (SingleServer()) {
         // Don't use _current_call.peer_id which is set to -1 after construction
         // of the backup call.
@@ -1332,7 +1341,7 @@ int Controller::HandleSocketFailed(bthread_id_t id, void* data, int error_code,
     }
     return 0;
 }
-
+// 延迟创建 call id
 CallId Controller::call_id() {
     butil::atomic<uint64_t>* target =
         (butil::atomic<uint64_t>*)&_correlation_id.value;

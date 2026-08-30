@@ -109,9 +109,17 @@ const int32_t UNSET_MAGIC_NUM = -123456789;
 
 typedef butil::FlatMap<std::string, std::string> UserFieldsMap;
 
-// A Controller mediates a single method call. The primary purpose of
-// the controller is to provide a way to manipulate settings per RPC-call 
-// and to find out about RPC-level errors.
+/*
+ * 一次 RPC 的上下文对象, 保存调用前的配置, 记录调用中的状态和调用后的结果, 保存:
+ *  - 调用配置: 控制超时、重试和连接方式;
+ *  - 请求/响应: 关联业务消息和额外数据;
+ *  - 错误结果: `_error_code`, `_error_text`;
+ *  - 网络状态: 记录实际连接和服务端地址;
+ *  - 声明周期: 取消、等待和异步回调;
+ *  - 一次尝试: 管理重试和 backup request;
+ *  - 可观测性: `_span`, `log_id`, `request_id`;
+ * 继承 `google::protobuf::RpcController`, 实现了 Protobuf RPC 所要求的错误、取消和重置接口
+ */
 class Controller : public google::protobuf::RpcController/*non-copyable*/ {
 friend class Channel;
 friend class ParallelChannel;
@@ -183,7 +191,7 @@ public:
 
     // Set/get the delay to send backup request in milliseconds. Use
     // ChannelOptions.backup_request_ms on unset.
-    void set_backup_request_ms(int64_t timeout_ms);
+    void set_backup_request_ms(int64_t timeout_ms); // 设置多久没有返回resp时, 发出备用请求
     void set_backup_request_policy(BackupRequestPolicy* policy) {
         _backup_request_policy = policy;
     }
@@ -699,10 +707,13 @@ private:
     void ResetPods();
     void ResetNonPods();
 
+    // 不要调用成员函数 cntl.StartCancel(), 该成员是 Protobuf 接口要求的, 但 brpc 明确禁止这种用法.
+    // 因为它可能与异步调用中的 Controller 析构发生竞争
     void StartCancel() override;
 
     // Using fixed start_realtime_us (microseconds since the Epoch) gives
     // more accurate deadline.
+    // 发出请求
     void IssueRPC(int64_t start_realtime_us);
 
     struct ClientSettings {
@@ -744,24 +755,24 @@ private:
 
     // Contexts for tracking and ending a sent request.
     // One RPC to a channel may send several requests due to retrying.
-    struct Call {
+    struct Call { // RPC 中的一次实际发送调用
         Call() { Reset(); }
         Call(Call*); //move semantics
         ~Call();
         void Reset();
         void OnComplete(Controller* c, int error_code, bool responded, bool end_of_rpc);
 
-        int nretry;                     // sent in nretry-th retry.
-        bool need_feedback;             // The LB needs feedback.
-        bool enable_circuit_breaker;    // The channel enabled circuit_breaker
+        int nretry;                     // 这是第几次尝试
+        bool need_feedback;             // 调用结束后是否需要反馈给负载均衡器
+        bool enable_circuit_breaker;    // 是否反馈给熔断器
         bool touched_by_stream_creator; 
-        SocketId peer_id;               // main server id
+        SocketId peer_id;               // 选择的服务器
         int64_t begin_time_us;          // sent real time.
         // The actual `Socket' for sending RPC. It's socket id will be
         // exactly the same as `peer_id' if `_connection_type' is
         // CONNECTION_TYPE_SINGLE. Otherwise, it may be a temporary
         // socket fetched from socket pool
-        SocketUniquePtr sending_sock;
+        SocketUniquePtr sending_sock; // 实际发送请求的连接
         StreamUserData* stream_user_data;
     };
 
@@ -825,6 +836,10 @@ private:
     const RetryPolicy* _retry_policy;
     // Synchronization object for one RPC call. It remains unchanged even
     // when retry happens. Synchronous RPC will wait on this id.
+    /*
+     * base CallId, 用于计算后续新的 cid.
+     * 充当 RPC 完成同步对象; 超时和取消事件入口; Join() 的等待对象
+     */
     CallId _correlation_id;
 
     ConnectionType _connection_type;
@@ -870,8 +885,8 @@ private:
     // for passing parameters to created bthread, don't modify it otherwhere.
     CompletionInfo _tmp_completion_info;
     
-    Call _current_call;
-    Call* _unfinished_call;
+    Call _current_call; // 当前尝试
+    Call* _unfinished_call; // 发出 backup request 时, 旧请求会移动到 _unfinished_call, 新请求成为 _current_call
     ExcludedServers* _accessed;
     
     StreamCreator* _stream_creator;
@@ -930,10 +945,10 @@ private:
 // canceled. If the call is canceled, the "done" callback will still be
 // called and the Controller will indicate that the call failed at that
 // time.
-void StartCancel(CallId id);
+void StartCancel(CallId id); // [客户端] 给 correlation ID 注入 ECANCELED
 
 // Suspend until the RPC finishes.
-void Join(CallId id);
+void Join(CallId id); // [客户端] 等待该 ID 被结束流程销毁
 
 // Get a global closure for doing nothing. Used in semi-synchronous
 // RPC calls. Example:
@@ -942,7 +957,7 @@ void Join(CallId id);
 //   ...
 //   brpc::Join(cntl1.call_id());
 //   brpc::Join(cntl2.call_id());
-google::protobuf::Closure* DoNothing();
+google::protobuf::Closure* DoNothing(); // [客户端] 可用于发出异步调用但稍后主动 Join()
 
 // Convert non-web symbols to web equivalence.
 void WebEscape(const std::string& source, std::string* output);
