@@ -48,7 +48,7 @@
 - 由于兼容旧内核 epoll one-shot 问题, 默认路径需要频繁执行 EPOLL_CTL_ADD/DEL, 不适合高频、性能关键的事件分发. brpc 自己的高性能 socket 处理通常使用专门的 EventDispatcher
 - 什么是 epoll one-shot?
     - 普通 epoll 默认采用 "持续监听" 语义, fd 注册之后, 只要它满足就绪条件, epoll_wait() 就可能反复返回该 fd, 而如果注册时加入 `EPOLLONESHOT`:
-        ```
+        ```cpp
         evt.events = EPOLLIN | EPOLLONESHOT;
         epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &evt);
         ```
@@ -75,3 +75,29 @@
     - 负载均衡时, 失败过的服务器会暂时放入 _accessed, 尽量避免重试时立即选回同一个节点
 
 # IOBuf
+- IOBuf 本质是一个 `BlockRef` 队列:
+    - `SmallView`: 最多两个引用时, 直接在 IOBuf 对象里保存, 不需要堆分配
+        ```cpp
+        struct SmallView {
+            BlockRef refs[2];
+        };
+        ```
+    -  `BigView`: 第三个无法合并的引用加入时, 转为 BigView, refs 是容量从 32 开始、按两倍扩容的环形队列, 这样从头部弹出完整引用只需移动 start, 不用搬移数组. 降到两个引用时, 又会退化回 SmallView
+        ```cpp
+        struct BigView {
+            int32_t magic;
+            uint32_t start;
+            BlockRef* refs; // refs[(start + i) & cap_mask]
+            uint32_t nref;
+            uint32_t cap_mask;
+            size_t nbytes;
+        };
+        ```
+    - 转换代码: `IOBuf::_push_or_move_back_ref_to_smallview(const BlockRef& r)` 和 `IOBuf::_pop_or_moveout_front_ref()`
+    - SmallView 和 BigView 放在同一个 union 中, 并且大小相等. SmallView 第一个引用的 offset 与 BigView 的 magic 位于同一位置. BigView 把 magic 设置为 -1, SmallView 的合法 offset 最高位为 0, 这样省掉了额外的类型字段:
+        ```cpp
+        bool IOBuf::_small() const {
+            return _bv.magic >= 0;
+        }
+        ```
+- 引用合并: 追加一个 BlockRef 时，如果它与末尾引用指向同一个 Block & 新引用的 offset 正好等于旧引用的 offset + length, 那么两者直接合并. 这对 TLS 共享 Block 很重要, 否则每次小字符串追加都会产生一个新引用.

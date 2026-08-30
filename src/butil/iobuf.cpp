@@ -293,6 +293,7 @@ IOBuf::Block* share_tls_block() {
     TLSData& tls_data = g_tls_data;
     IOBuf::Block* const b = tls_data.block_head;
     if (b != NULL && !b->full()) {
+        // 当前 tls block 未满时直接使用
         return b;
     }
     IOBuf::Block* new_block = NULL;
@@ -823,12 +824,12 @@ int IOBuf::_cut_by_delim(IOBuf* out, char const* dbegin, size_t ndelim) {
 // Since cut_into_file_descriptor() allocates iovec on stack, IOV_MAX=1024
 // is too large(in the worst case) for bthreads with small stacks.
 static const size_t IOBUF_IOV_MAX = 256;
-
+// 把多个 BlockRef 转换成 iovec[], 然后调用 writev
 ssize_t IOBuf::pcut_into_file_descriptor(int fd, off_t offset, size_t size_hint) {
     if (empty()) {
         return 0;
     }
-    
+    // 最多一次收集 256 个引用, 以避免 bthread 小栈上分配过大的数组
     const size_t nref = std::min(_ref_num(), IOBUF_IOV_MAX);
     struct iovec vec[nref];
     size_t nvec = 0;
@@ -840,7 +841,7 @@ ssize_t IOBuf::pcut_into_file_descriptor(int fd, off_t offset, size_t size_hint)
         vec[nvec].iov_len = r.length;
         ++nvec;
         cur_len += r.length;
-    } while (nvec < nref && cur_len < size_hint);
+    } while (nvec < nref && cur_len < size_hint); // size_hint 是近似值, 因为最后一个 BlockRef 会整体加入, 实际提交长度可能超过 hint
 
     ssize_t nw = 0;
 
@@ -851,6 +852,7 @@ ssize_t IOBuf::pcut_into_file_descriptor(int fd, off_t offset, size_t size_hint)
         nw = ::writev(fd, vec, nvec);
     }
     if (nw > 0) {
+        // 成功写出后用 pop_front(nw) 消费已写字节
         pop_front(nw);
     }
     return nw;
@@ -879,7 +881,7 @@ ssize_t IOBuf::cut_into_writer(IWriter* writer, size_t size_hint) {
     }
     return nw;
 }
-
+// ssl 不支持 io_vec 这种scatter/gather 路径, 所以 SSL_write 每次只写第一个连续 BlockRef
 ssize_t IOBuf::cut_into_SSL_channel(SSL* ssl, int* ssl_error) {
     *ssl_error = SSL_ERROR_NONE;
     if (empty()) {
@@ -1025,14 +1027,14 @@ ssize_t IOBuf::cut_multiple_into_writer(
     return nw;
 }
 
-
+// 最加另一个 IOBUF, 不复制payload, 而是逐个复制 BlockRef 并增加引用计数
 void IOBuf::append(const IOBuf& other) {
     const size_t nref = other._ref_num();
     for (size_t i = 0; i < nref; ++i) {
         _push_back_ref(other._ref_at(i));
     }
 }
-
+// 转移所有权, 所以不需要增减引用计数
 void IOBuf::append(const Movable& movable_other) {
     if (empty()) {
         swap(movable_other.value());
@@ -1067,7 +1069,7 @@ int IOBuf::append(char const* s) {
     }
     return -1;
 }
-
+// 追加普通内存, 把数据复制进当前线程的TLS Block, 增加相应的 BlockRef
 int IOBuf::append(void const* data, size_t count) {
     if (BAIDU_UNLIKELY(!data)) {
         return -1;
@@ -1117,7 +1119,7 @@ int IOBuf::appendv(const const_iovec* vec, size_t n) {
     }
     return 0;
 }
-
+// 不复制用户数据, 只创建一个特殊的 Block Header, 记录外部数据指针+长度+deleter+meta, 在最后一个引用释放时执行deleter
 int IOBuf::append_user_data_with_meta(void* data,
                                       size_t size,
                                       std::function<void(void*)> deleter,
@@ -1230,7 +1232,13 @@ IOBuf::Area IOBuf::reserve(size_t count) {
     }
     return result;
 }
-
+/*
+ * unsafe:
+ *  - Area 保存的是 BlockRef 索引，不是稳定指针;
+ *  - 从头部 cut/pop 后索引可能失效;
+ *  - IOBuf 被复制后 Block 可能共享;
+ *  - 写入共享 Block 会影响其他 IOBuf
+ */
 int IOBuf::unsafe_assign(Area area, const void* data) {
     if (area == INVALID_AREA || data == NULL) {
         LOG(ERROR) << "Invalid parameters";
@@ -1477,7 +1485,11 @@ void IOPortal::clear() {
 }
 
 const int MAX_APPEND_IOVEC = 64;
-
+/*
+ * 准备若干未使用的 Block 尾部作为 iovec, 调用 readv 直接写入这些 Block, 然后为实际读取的范围建立 BlockRef
+ * 网络接收路径是: kernel → Block 空闲区 → BlockRef
+ * 中间不需要再复制到一个连续临时缓冲区, IOPortal 还会暂存未写满的 Block, 让后续同一连接读到的数据更可能落在同一个 Block 中
+ */
 ssize_t IOPortal::pappend_from_file_descriptor(
     int fd, off_t offset, size_t max_count) {
     iovec vec[MAX_APPEND_IOVEC];

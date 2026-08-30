@@ -460,17 +460,18 @@ extern void  (*blockmem_deallocate)(void*);
 
 } // namespace iobuf
 
+// 真正拥有内存的对象
 struct IOBuf::Block {
-    butil::atomic<int> nshared;
-    uint16_t flags;
+    butil::atomic<int> nshared; // 原子引用计数
+    uint16_t flags; // 普通块、用户数据块、是否被 profiler 采样
     uint16_t abi_check;  // original cap, never be zero.
-    uint32_t size;
-    uint32_t cap;
+    uint32_t size; // 已经使用到的位置，即写入高水位
+    uint32_t cap; // 数据区容量
     // When flag is 0, portal_next is valid.
     // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data_meta is valid.
     union {
-        Block* portal_next;
-        uint64_t data_meta;
+        Block* portal_next; // 缓存链表指针
+        uint64_t data_meta; // 用户数据块的元信息
     } u;
     // When flag is 0, data points to `size` bytes starting at `(char*)this+sizeof(Block)'
     // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data points to the user data and
@@ -578,6 +579,7 @@ private:
 };
 
 namespace iobuf {
+// 每个线程有一条 Block 缓存链, 默认最多缓存 8 个未写满的 Block
 struct TLSData {
     // Head of the TLS block chain.
     IOBuf::Block* block_head;
@@ -625,7 +627,7 @@ inline void release_tls_block(IOBuf::Block* b) {
         }
     }
 }
-
+// 普通Block通过一次malloc同时分配header+payload数据区
 inline IOBuf::Block* create_block(const size_t block_size) {
     if (block_size > 0xFFFFFFFFULL) {
         LOG(FATAL) << "block_size=" << block_size << " is too large";
@@ -640,7 +642,7 @@ inline IOBuf::Block* create_block(const size_t block_size) {
 }
 
 inline IOBuf::Block* create_block() {
-    return create_block(IOBuf::DEFAULT_BLOCK_SIZE);
+    return create_block(IOBuf::DEFAULT_BLOCK_SIZE); // 8192
 }
 
 void* cp(void *__restrict dest, const void *__restrict src, size_t n);

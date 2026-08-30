@@ -74,6 +74,8 @@ public:
 
     // can't directly use `struct iovec' here because we also need to access the
     // reference counter(nshared) in Block*
+    // 它表示 block->data[offset ... offset + length]
+    // 一个 Block 可以被多个 IOBuf、多个 BlockRef 同时引用, 因此一个很大的 Block 可以被逻辑切成多段, 而不用复制字节
     struct BlockRef {
         // NOTICE: first bit of `offset' is shared with BigView::start
         uint32_t offset;
@@ -447,6 +449,7 @@ inline bool operator!=(const butil::IOBuf& b1, const butil::IOBuf& b2)
 
 // IOPortal is a subclass of IOBuf that can read from file descriptors.
 // Typically used as the buffer to store bytes from sockets.
+// IOPortal 是可直接从 fd 读取的 IOBuf
 class IOPortal : public IOBuf {
 public:
     IOPortal() : _block(NULL) { }
