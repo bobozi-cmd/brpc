@@ -369,7 +369,7 @@ template <typename _K, typename _T, typename _H, typename _E,
           bool _S, typename _A, bool _M>
 _T* FlatMap<_K, _T, _H, _E, _S, _A, _M>::insert(
     const key_type& key, const mapped_type& value) {
-    mapped_type *p = &operator[](key);
+    mapped_type *p = &operator[](key); // 已有 key 会被覆盖
     *p = value;
     return p;
 }
@@ -392,17 +392,20 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::erase(const K2& key, _T* old_value) {
     if (!first_node.is_valid()) {
         return 0;
     }
+    // 删除桶首元素时分两种情况
     if (_eql(first_node.element().first_ref(), key)) {
         if (old_value) {
             *old_value = first_node.element().second_movable_ref();
         }
         if (first_node.next == NULL) {
+            // 1. 没有后继: 析构元素, 将桶设成无效
             first_node.destroy_element();
             first_node.set_invalid();
             if (_S) {
                 bit_array_unset(_thumbnail, index);
             }
         } else {
+            // 2. 存在后继: 把第二个节点的 key/value 移到桶首. 再回收第二个节点
             // A seemingly correct solution is to copy the memory of *p to
             // first_node directly like this:
             //   first_node.destroy_element();
@@ -546,13 +549,16 @@ template <typename _K, typename _T, typename _H, typename _E,
           bool _S, typename _A, bool _M>
 template <typename K2>
 _T* FlatMap<_K, _T, _H, _E, _S, _A, _M>::seek(const K2& key) const {
+    // 计算 key 的hash -> 计算bucket下标
     Bucket& first_node = _buckets[flatmap_mod(_hashfn(key), _nbucket)];
     if (!first_node.is_valid()) {
         return NULL;
     }
+    // 检查桶内嵌的首元素
     if (_eql(first_node.element().first_ref(), key)) {
         return &first_node.element().second_ref();
     }
+    // 沿 next 遍历冲突链, 平均复杂度是 O(1)，最坏情况下为 O(n)
     Bucket *p = first_node.next;
     while (p) {
         if (_eql(p->element().first_ref(), key)) {
@@ -572,6 +578,7 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::seek_all(const K2& key) const {
     if (!first_node.is_valid()) {
         return v;
     }
+    // 遍历整条链并返回所有匹配值
     if (_eql(first_node.element().first_ref(), key)) {
         v.push_back(&first_node.element().second_ref());
     }
@@ -589,7 +596,7 @@ template <typename _K, typename _T, typename _H, typename _E,
           bool _S, typename _A, bool _M>
 template<bool Multi>
 typename std::enable_if<!Multi, _T&>::type
-FlatMap<_K, _T, _H, _E, _S, _A, _M>::operator[](const key_type& key) {
+FlatMap<_K, _T, _H, _E, _S, _A, _M>::operator[](const key_type& key) { // 非 Multi版本插入
     const size_t index = flatmap_mod(_hashfn(key), _nbucket);
     Bucket& first_node = _buckets[index];
     if (!first_node.is_valid()) {
@@ -597,9 +604,10 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::operator[](const key_type& key) {
         if (_S) {
             bit_array_set(_thumbnail, index);
         }
-        new (&first_node) Bucket(key);
+        new (&first_node) Bucket(key); // 目标桶为空, 直接在桶数组里面 placement new
         return first_node.element().second_ref();
     }
+    // 目标桶非空, 遍历冲突链, 找到相同key, 返回value
     Bucket *p = &first_node;
     while (true) {
         if (_eql(p->element().first_ref(), key)) {
@@ -607,10 +615,12 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::operator[](const key_type& key) {
         }
         if (NULL == p->next) {
             if (is_too_crowded(_size) && resize(_nbucket + 1)) {
+                // 如果当前负载已经过高，先尝试扩容，然后递归重试插入
                 return operator[](key);
             }
             // Fail to resize is OK.
             ++_size;
+            // 到达链尾还没找到, 从 _pool 取一个新节点, 挂到链尾
             Bucket* newp = new (_pool.get()) Bucket(key);
             p->next = newp;
             return newp->element().second_ref();
@@ -638,8 +648,8 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::operator[](const key_type& key) {
         Bucket *p = &first_node;
         bool need_scale = false;
         while (NULL != p) {
-            // Increase the capacity of bucket when
-            // hash collision occur and map is crowded.
+            // 如果桶里所有元素都与新 key 相同, 就不会为了这条长链扩容.
+            // 因为相同 key 的 hash 必然一样, 扩容也无法拆散这条链
             if (!_eql(p->element().first_ref(), key)) {
                 need_scale = true;
                 break;
@@ -750,18 +760,22 @@ FlatMap<_K, _T, _H, _E, _S, _A, _M>::new_buckets_and_thumbnail(size_t size,
     return NewBucketsInfo{buckets, thumbnail, new_nbucket};
 }
 
+// 扩容是 O(size), 并且会使原先取得的指针、引用和迭代器失效
 template <typename _K, typename _T, typename _H, typename _E,
           bool _S, typename _A, bool _M>
 bool FlatMap<_K, _T, _H, _E, _S, _A, _M>::resize(size_t nbucket) {
+    // 计算新的桶数量, 保证当前元素数量不超过 load factor
     optional<NewBucketsInfo> info = new_buckets_and_thumbnail(_size, nbucket);
     if (!info.has_value()) {
         return false;
     }
-
+    // 分配 new_nbucket + 1 个桶, 遍历旧表中的全部元素, 
     for (iterator it = begin(); it != end(); ++it) {
         const key_type& key = Element::first_ref_from_value(*it);
+        // 重新计算它们在新表中的位置
         const size_t index = flatmap_mod(_hashfn(key), info->nbucket);
         Bucket& first_node = info->buckets[index];
+        // 在新桶中默认构造元素, 然后移动赋值 value
         if (!first_node.is_valid()) {
             if (_S) {
                 bit_array_set(info->thumbnail, index);
@@ -778,7 +792,7 @@ bool FlatMap<_K, _T, _H, _E, _S, _A, _M>::resize(size_t nbucket) {
         }
     }
     size_t saved_size = _size;
-    clear();
+    clear(); // 释放旧桶数组
     if (!is_default_buckets()) {
         get_allocator().Free(_buckets);
         if (_S) {
@@ -786,7 +800,7 @@ bool FlatMap<_K, _T, _H, _E, _S, _A, _M>::resize(size_t nbucket) {
         }
     }
     _nbucket = info->nbucket;
-    _buckets = info->buckets;
+    _buckets = info->buckets; // 切换 _buckets 指针
     _thumbnail = info->thumbnail;
     _size = saved_size;
 

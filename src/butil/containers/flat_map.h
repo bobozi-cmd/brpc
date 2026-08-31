@@ -207,15 +207,17 @@ public:
     typename std::enable_if<Multi, size_t>::type
     erase(const K2& key, std::vector<mapped_type>* old_values = NULL);
 
-    // Remove all items. Allocated spaces are NOT returned by system.
+    // 析构所有元素, 把冲突节点放回 pool, 但不释放 pool 的 block.
+    // 反复清空再填充时用 clear() 更快, 确定不再复用容量时可以用 clear_and_reset_pool().
     void clear();
 
-    // Remove all items and return all allocated spaces to system.
+    // 在 clear() 后调用 _pool.reset(), 真正释放 pool 内存
     void clear_and_reset_pool();
 
     // Search for the value associated with |key|.
     // If `_Multi=false', Search for any of multiple values associated with |key|.
     // Returns: address of the value.
+    // seek() 是 const 方法，却返回可修改的 T*, 所以这个容器允许通过 const FlatMap 修改 value, const-correctness 比标准容器宽松
     template <typename K2> mapped_type* seek(const K2& key) const;
     template <typename K2> std::vector<mapped_type*> seek_all(const K2& key) const;
 
@@ -309,10 +311,18 @@ public:
             }
             std::swap(next, rhs.next);
         }
-
+        /*
+         * 冲突链表指针:
+         * next == (Bucket*)-1 表示桶无效/为空
+         * next == nullptr 表示桶有效，但没有后继节点
+         */
         Bucket* next;
 
     private:
+        /* 一块经过对齐, 但不自动构造对象的内存.
+         * 允许空桶不构造 K/T, 避免一次性构造整个桶数组中的所有对象.
+         * 实际对象通过 placement new 构造, 通过显式析构销毁.
+         */ 
         ManualConstructor<Element> element_space_;
     };
 
@@ -378,17 +388,19 @@ template <typename _Map, typename _Element> friend class SparseFlatMapIterator;
 
     static const size_t default_nthumbnail = BIT_ARRAY_LEN(DEFAULT_NBUCKET);
     // Note: need an extra bucket to let iterator know where buckets end.
-    // Small map optimization.
+    // 小对象优化, 对象内部直接带有默认桶数组. 小map不需要任何桶数组的堆分配, +1的额外桶作为迭代器哨兵
     Bucket _default_buckets[DEFAULT_NBUCKET + 1];
     uint64_t _default_thumbnail[default_nthumbnail];
     size_t _size;
     size_t _nbucket;
     Bucket* _buckets;
+    // SparseFlatMap维护 bitmap, 桶非空对应 bit 为 1, 否则为0. 迭代时通过位运算快速寻找下一个非空桶
     uint64_t* _thumbnail;
     u_int _load_factor;
     bool _is_default_load_factor;
     hasher _hashfn;
     key_equal _eql;
+    // 内存池按约 1 KB 的 block 批量分配节点, 删除节点时放回 freelist, 而不是立即 free, 因此频繁插入删除比较便宜
     SingleThreadedPool<sizeof(Bucket), 1024, 16, allocator_type> _pool;
 };
 
@@ -456,7 +468,11 @@ public:
 private:
     Map _map;
 };
-
+/*
+ * 通过 _thumbnail 位图 和位运算快速定位下一个非空桶, 适合桶很多、元素很少的情况; 
+ * 普通 FlatMap 迭代复杂度接近 O(bucket_count + size);
+ * Sparse 版本可以减少空桶扫描, 但会增加位图内存和插入删除时的维护成本;
+ */
 template <typename _K, typename _T,
           typename _Hash = DefaultHasher<_K>,
           typename _Equal = DefaultEqualTo<_K>,
