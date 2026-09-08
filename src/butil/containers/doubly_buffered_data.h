@@ -82,7 +82,14 @@ class Void { };
 
 template <typename T> struct IsVoid : false_type { };
 template <> struct IsVoid<Void> : true_type { };
-
+/*
+ * 为"读极多、写极少"场景设计的双缓冲并发容器.
+ * 让不同线程之间的读取几乎没有竞争, 代价是一次写入需要修改两份数据, 并等待旧读者退出, 典型用途是 brpc 的负载均衡器:
+ * - 每个 RPC 都要读取服务器列表;
+ * - 服务器加入、移除相对少见;
+ * - 不能让大量 RPC 在一把全局读写锁上竞争;
+ * `T`: 需要并发读取到数据类型, `TLS`: 可选的线程局部用户数据, `AllowBthreadSuspended`: 读临界区内是否允许 bthread 挂起或迁移
+ */
 template <typename T, typename TLS = Void, bool AllowBthreadSuspended = false>
 class DoublyBufferedData {
     class Wrapper;
@@ -91,6 +98,7 @@ class DoublyBufferedData {
     typedef std::shared_ptr<Wrapper> WrapperSharedPtr;
     typedef std::weak_ptr<Wrapper> WrapperWeakPtr;
 public:
+    // 读操作的生命周期凭证, 只要 ScopedPtr 还活着, 它指向的副本就不会被写者修改
     class ScopedPtr {
     friend class DoublyBufferedData;
     public:
@@ -157,7 +165,10 @@ private:
 
     WrapperSharedPtr GetWrapper();
 
-    // Foreground and background void.
+    /*
+     * _data[_index]  当前前台副本，只供读者读取
+     * _data[!_index] 当前后台副本，供写者修改
+     */
     T _data[2];
 
     // Index of foreground instance.
@@ -166,13 +177,13 @@ private:
     // Key to access thread-local wrappers.
     WrapperTLSId _wrapper_key;
 
-    // All thread-local instances.
+    // 记录所有访问过该对象的线程
     std::vector<WrapperWeakPtr> _wrappers;
 
     // Sequence access to _wrappers.
     pthread_mutex_t _wrappers_mutex{};
 
-    // Sequence modifications.
+    // 保证同一时间只有一个写者
     pthread_mutex_t _modify_mutex{};
 };
 
@@ -188,10 +199,11 @@ template <typename T>
 class DoublyBufferedDataWrapperBase<T, Void> {
 };
 
-// Use pthread_key store data limits by _SC_THREAD_KEYS_MAX.
-// WrapperTLSGroup can store Wrapper in thread local storage.
-// WrapperTLSGroup will destruct Wrapper data when thread exits,
-// other times only reset Wrapper inner structure.
+/*
+ * pthread_key 是 线程局部存储键, 相比于语言级静态 thread_local, 它是运行时动态创建的.
+ * DoublyBufferedData 需要为"每个 DBD 对象 × 每个 pthread"保存一个 Wrapper, 直观上就是为每个DBD创建一个 pthread_key_t.
+ * 但是pthread_key_t数量有上限, 所以需要自己实现.
+ */
 template <typename T, typename TLS, bool AllowBthreadSuspended>
 class DoublyBufferedData<T, TLS, AllowBthreadSuspended>::WrapperTLSGroup {
 public:
@@ -211,7 +223,7 @@ public:
     private:
         WrapperSharedPtr _data[ELEMENTS_PER_BLOCK];
     };
-
+    // 从全局 _s_id/_s_free_ids 获得一个整数 ID, 支持远多于 PTHREAD_KEYS_MAX 的 pthread_key
     static WrapperTLSId key_create() {
         BAIDU_SCOPED_LOCK(_s_mutex);
         WrapperTLSId id = 0;
@@ -233,7 +245,7 @@ public:
         _get_free_ids().push_back(id);
         return 0;
     }
-
+    // 从每个线程维护的 _s_tls_blocks 中, 通过 id 定位 Wrapper
     static WrapperSharedPtr get_or_create_tls_data(WrapperTLSId id) {
         if (BAIDU_UNLIKELY(id < 0)) {
             CHECK(false) << "Invalid id=" << id;
@@ -349,7 +361,7 @@ public:
         SubRef(index);
         SignalReadCond(index);
     }
-
+    // 通过 scoped_lock 读者锁, 来等待读者释放锁
     inline void WaitReadDone() {
         BAIDU_SCOPED_LOCK(_mutex);
     }
@@ -385,6 +397,10 @@ public:
     
 private:
     DoublyBufferedData* _control;
+    /*
+     * 这不是全局锁, 而是每个 pthread 独享一个 Wrapper::_mutex.
+     * 线程 A 和线程 B 读取时锁的是不同 mutex，因此读者之间基本没有竞争;
+     */
     pthread_mutex_t _mutex{};
     // For `AllowBthreadSuspended=true'.
     // _cond[0] for _ref[0], _cond[1] for _ref[1]
@@ -483,9 +499,9 @@ int DoublyBufferedData<T, TLS, AllowBthreadSuspended>::Read(
         // Use reference count instead of mutex to indicate read of
         // foreground instance, so during the read process, there is
         // no need to lock mutex and bthread is allowed to be suspended.
-        w->BeginRead();
+        w->BeginRead(); // 锁住本线程的 Wrapper
         // UnsafeRead will update ptr->_index
-        ptr->_data = UnsafeRead(ptr->_index);
+        ptr->_data = UnsafeRead(ptr->_index); // acquire 读取 _index
         w->AddRef(ptr->_index);
         w->BeginReadRelease();
     } else {
@@ -516,10 +532,9 @@ size_t DoublyBufferedData<T, TLS, AllowBthreadSuspended>::Modify(Fn&& fn, Args&&
     // than _wrappers_mutex is to avoid blocking threads calling
     // GetWrapper() too long. Most of the time, modifications
     // are done by one thread, contention should be negligible.
-    BAIDU_SCOPED_LOCK(_modify_mutex);
-    int bg_index = !_index.load(butil::memory_order_relaxed);
-    // background instance is not accessed by other threads, being safe to
-    // modify.
+    BAIDU_SCOPED_LOCK(_modify_mutex); // 串行化所有写者
+    int bg_index = !_index.load(butil::memory_order_relaxed); // 确定后台副本
+    // 修改后台副本, 当前后台不会被任何读者访问, 所以不需要锁住读者
     const size_t ret = fn(_data[bg_index], std::forward<Args>(args)...);
     if (!ret) {
         return 0;
@@ -529,11 +544,10 @@ size_t DoublyBufferedData<T, TLS, AllowBthreadSuspended>::Modify(Fn&& fn, Args&&
     // The release fence matches with the acquire fence in UnsafeRead() to
     // make readers which just begin to read the new foreground instance see
     // all changes made in fn.
-    _index.store(bg_index, butil::memory_order_release);
-    bg_index = !bg_index;
+    _index.store(bg_index, butil::memory_order_release); // 发布新前台, 新进入的读者会读取新数据
+    bg_index = !bg_index; // 前后台翻转
     
-    // Wait until all threads finishes current reading. When they begin next
-    // read, they should see updated _index.
+    // 等待旧前台的读者全部离开
     {
         BAIDU_SCOPED_LOCK(_wrappers_mutex);
         // The chance to remove expired weak_ptr.
@@ -555,7 +569,7 @@ size_t DoublyBufferedData<T, TLS, AllowBthreadSuspended>::Modify(Fn&& fn, Args&&
             }),
             _wrappers.end());
     }
-
+    // 修改旧前台的数据, 使两个副本重新等价
     const size_t ret2 = fn(_data[bg_index], std::forward<Args>(args)...);
     CHECK_EQ(ret2, ret) << "index=" << _index.load(butil::memory_order_relaxed);
     return ret2;
