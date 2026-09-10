@@ -146,3 +146,34 @@
 - 内存可以由队列通过 `malloc` 持有, 也可以由调用方提供, 因此适合栈上小队列、对象内嵌存储或一次性联合分配; 外部存储必须满足 `T` 的对齐要求, 且生命周期不能短于队列
 - 它本身不是线程安全的. 多线程访问必须由调用方加锁, 或改用专门的 SPSC/MPMC 并发队列
 - 不适合容量无法预估、需要自动扩容、需要阻塞等待或要求 lock-free 并发访问的场景
+
+# 负载均衡和容错
+## LoadBalancer
+- 核心抽象API, 覆盖 "节点变化 -> 请求开始 -> 请求结束" 三阶段:
+    - AddServer(const ServerId& server) + RemoveServer(const ServerId& server): 命名服务发现节点变化后, 会通知负载均衡器增加或删除节点. 职责分离: NamingService 负责感知有哪些节点, LoadBalancer 负载选择哪个节点.
+    - SelectServer(const ServerIn& in, SelectOut* out): 每次真正发起请求前, Controller::IssueRPC 调用其选择服务
+    - Feedback(const CallInfo& info): 完成请求后, 告知 LB 请求发给了哪个节点, 耗时多少, 是否发生错误, 自适应算法便可以据此降低慢节点或异常节点的选择概率.
+    - brpc把LB分成两类:
+        - 无反馈算法: RR, Random
+        - 有反馈算法: locality-aware, ...
+
+- Round Robin 为什么不用全局原子计数器做轮询?
+    - 最简单的实现: `index = atomic_counter.fetch_add(1) % node_count;`, 但在高并发下，所有线程都会修改同一个原子变量，那个 cache line 会不断在 CPU 核之间同步
+    - 所以 brpc 使用 TLS, 让每个线程独立维护自己的状态, 初始化时, 不同线程:
+        - 从随机位置开始
+        - 使用不同的大质数作为步长
+        - 不争抢一个全局计数器
+    - 因此它不保证严格的请求序列一定是 A -> B -> C -> D, 但在请求量足够大时, 各节点被选中的次数会很接近.
+
+- Round Robin 为什么使用 `vector + map` 保存 Servers?
+    - 两种容器服务于不同的访问模式:
+        - `server_list: vector<ServerId>` 支持按 RR 的 `offset` 以 O(1) 取得候选节点, 连续存储也有利于遍历不可用节点时的 CPU cache 局部性
+        - `server_map: map<ServerId, size_t>` 保存 ServerId 到 vector 下标的映射, 用于判重以及在 O(logN) 时间内定位待删除节点
+    - 删除节点时不调用 `vector::erase`, 而是用末尾节点覆盖待删除位置, 更新该节点在 map 中的下标后再 `pop_back()`. 这样定位为 O(logN), vector 内的删除为 O(1), 代价是节点顺序可能改变; RR 不依赖稳定顺序, 因而可以接受
+    - 只用 `map` 虽然足以实现轮询, 但 map 没有随机下标访问. 根据 `offset` 取得第 i 个元素需要从迭代器前进, 最坏为 O(N); 保存跨请求的迭代器也会与动态更新、双缓冲版本切换产生生命周期问题
+    - 只用 `vector` 能高效选择节点, 但判重和定位指定待删除节点需要 O(N) 扫描
+    - `unordered_map` 不能替代 vector: 它的平均 O(1) 是按 key 查找, 并不支持按 RR 下标取得第 i 个元素; 迭代顺序也不稳定, rehash 还会使迭代器失效
+    - `unordered_map<ServerId, size_t>` 可以在技术上替代当前辅助索引 map, 将判重和定位降为平均 O(1). 但该索引只在命名服务更新节点时使用, 每次 RPC 的热点选择路径只访问 vector, 因此收益通常有限; `map` 则提供稳定的 O(logN) 最坏复杂度且没有 rehash 延迟峰值
+
+- ExcludedServers 为什么保存 SocketId, 而不是 IP 地址?
+    - 一个地址对应的旧连接可能已经失败，随后又创建了新连接. SocketId 带有对象身份信息, 可以区分同一个IP的新旧 Socket.

@@ -40,6 +40,8 @@ bool RoundRobinLoadBalancer::Add(Servers& bg, const ServerId& id) {
 }
 
 bool RoundRobinLoadBalancer::Remove(Servers& bg, const ServerId& id) {
+    // 例子: 删除前 [A, B, C, D], 删除B后 [A, D, C], 这样避免搬 B 后面所有元素
+    // 节点顺序会改变, 但是RR并不要求顺序稳定
     std::map<ServerId, size_t>::iterator it = bg.server_map.find(id);
     if (it != bg.server_map.end()) {
         const size_t index = it->second;
@@ -109,17 +111,18 @@ int RoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
     }
     TLS tls = s.tls();
     if (tls.stride == 0) {
+        // 用大质数和随机值初始化线程独立维护的 RR index
         tls.stride = bthread::prime_offset();
         // use random at first time, for the case of
         // use rr lb every time in new thread
         tls.offset = butil::fast_rand_less_than(n);
     }
-
+    // 核心选择逻辑
     for (size_t i = 0; i < n; ++i) {
-        tls.offset = (tls.offset + tls.stride) % n;
+        tls.offset = (tls.offset + tls.stride) % n; // 计算下一个节点的下标
         const SocketId id = s->server_list[tls.offset].id;
-        if (((i + 1) == n  // always take last chance
-             || !ExcludedServers::IsExcluded(in.excluded, id))
+        if (((i + 1) == n  // 遍历到最后一个节点时忽略 excluded 条件, 再尝试一次
+             || !ExcludedServers::IsExcluded(in.excluded, id)) // 跳过重试时已经访问过的, 且不是最后一个的节点
             && IsServerAvailable(id, out->ptr)) {
             s.tls() = tls;
             return 0;

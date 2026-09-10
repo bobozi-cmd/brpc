@@ -35,26 +35,26 @@ class Controller;
 class LoadBalancer : public NonConstDescribable, public Destroyable {
 public:
     struct SelectIn {
-        int64_t begin_time_us;
-        // Weight of different nodes could be changed.
+        int64_t begin_time_us; // 本次具体网络调用的开始时间
+        // 表示节点权重是否可能动态变化
         bool changable_weights;
         bool has_request_code;
-        uint64_t request_code;
-        const ExcludedServers* excluded;
+        uint64_t request_code; // 一致性哈希等算法用它保证相同 key 尽量落到相同节点
+        const ExcludedServers* excluded; // 重试时已经失败过的节点, 避免马上再次选中
     };
 
     struct SelectOut {
         explicit SelectOut(SocketUniquePtr* ptr_in)
             : ptr(ptr_in), need_feedback(false) {}
-        SocketUniquePtr* ptr;
-        bool need_feedback;
+        SocketUniquePtr* ptr; // 最终选中的节点连接
+        bool need_feedback; // 请求完成后，是否需要把结果反馈给负载均衡器
     };
 
     struct CallInfo {
         // Exactly same with SelectIn.begin_time_us, may be different from
         // controller->_begin_time_us which is beginning of the RPC.
         int64_t begin_time_us;
-        // Remote side of the call.
+        // 请求发给了哪个节点
         SocketId server_id;
         // A RPC may have multiple calls, this error may be different from
         // controller->ErrorCode();
@@ -108,6 +108,7 @@ protected:
 
     // Returns true and set `out' if the server is available (not failed, not logoff).
     // Otherwise, returns false.
+    // 检查节点是否在列表中 & 对应Socket是否失败或下线
     static bool IsServerAvailable(SocketId id, SocketUniquePtr* out);
 };
 

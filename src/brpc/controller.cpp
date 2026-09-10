@@ -686,7 +686,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             if (!SingleServer()) {
                 if (_accessed == NULL) {
                     _accessed = ExcludedServers::Create(
-                            std::min(_max_retry, RETRY_AVOIDANCE));
+                            std::min(_max_retry, RETRY_AVOIDANCE)); // 最多存储 RETRY_AVOIDANCE(8) 个失败的服务器
                     if (NULL == _accessed) {
                         SetFailed(ENOMEM, "Fail to create ExcludedServers");
                         goto END_OF_RPC;

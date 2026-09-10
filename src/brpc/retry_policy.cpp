@@ -21,25 +21,31 @@
 
 
 namespace brpc {
-
+// 重试白名单中的错误, 可能导致操作重复执行(如重复扣款), 所以使用重试机制的业务最好满足:
+// - 操作天然幂等，例如查询
+// - 携带唯一请求 ID，由服务端去重
+// - 使用幂等键或业务状态机阻止重复提交
 bool RpcRetryPolicy::DoRetry(const Controller* controller) const {
     const int error_code = controller->ErrorCode();
     if (!error_code) {
         return false;
     }
+    // 连接或传输故障: 换一个节点或重新建立连接可能成功
+    // 节点状态发生变化, 例如服务滚动更新
+    // 节点过载或资源不足
     return (EFAILEDSOCKET == error_code
             || EEOF == error_code
-            || EHOSTDOWN == error_code
-            || ELOGOFF == error_code
-            || ETIMEDOUT == error_code // This is not timeout of RPC.
-            || ELIMIT == error_code
+            || EHOSTDOWN == error_code // 节点当前不可用
+            || ELOGOFF == error_code // 服务正在退出
+            || ETIMEDOUT == error_code // This is not timeout of RPC. 可能是连接等局部操作超时, 整个RPC deadline 到期使用的是 ERPCTIMEDOUT
+            || ELIMIT == error_code // 服务达到最大并发限制
             || ENOENT == error_code
             || EPIPE == error_code
             || ECONNREFUSED == error_code
             || ECONNRESET == error_code
-            || ENODATA == error_code
-            || EOVERCROWDED == error_code
-            || EH2RUNOUTSTREAMS == error_code);
+            || ENODATA == error_code // 负载均衡器没有节点可选
+            || EOVERCROWDED == error_code // 写缓冲等资源过于拥挤
+            || EH2RUNOUTSTREAMS == error_code); // HTTP/2 连接暂时没有可用 stream
 }
 
 // NOTE(gejun): g_default_policy can't be deleted on process's exit because

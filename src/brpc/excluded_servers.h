@@ -56,7 +56,7 @@ private:
     // all mutable methods with this mutex. In ordinary channels, this mutex
     // is never contended.
     mutable butil::Mutex _mutex;
-    butil::BoundedQueue<SocketId> _l;
+    butil::BoundedQueue<SocketId> _l; // 有容量限制的队列, 队列满了就淘汰最老的记录
     SocketId _space[0];
 };
 
@@ -81,7 +81,7 @@ inline void ExcludedServers::Destroy(ExcludedServers* ptr) {
 inline void ExcludedServers::Add(SocketId id) {
     BAIDU_SCOPED_LOCK(_mutex);
     const SocketId* last_id = _l.bottom();
-    if (last_id == NULL || *last_id != id) {
+    if (last_id == NULL || *last_id != id) { // 只防连续插入同一个节点, 不完全去重
         _l.elim_push(id);
     }
 }

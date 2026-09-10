@@ -43,9 +43,10 @@ public:
 
 private:
     struct Servers {
-        std::vector<ServerId> server_list;
-        std::map<ServerId, size_t> server_map;
+        std::vector<ServerId> server_list; // 根据下标快速选择节点
+        std::map<ServerId, size_t> server_map; // 判断节点是否存在, 并找到它在vector中的位置
     };
+    // 每个线程独立维护自己: offset(当前走到哪), stride(每次向前跨多少步)
     struct TLS {
         TLS() : stride(0), offset(0) { }
         uint32_t stride;
