@@ -37,7 +37,7 @@ bool WeightedRandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
         bg.server_list.reserve(128);
     }
     uint32_t weight = 0;
-    if (!butil::StringToUint(id.tag, &weight) || weight <= 0) {
+    if (!butil::StringToUint(id.tag, &weight) || weight <= 0) { // 权重来自 ServerId.tag
         if (FLAGS_default_weight_of_wlb > 0) {
             LOG(WARNING) << "Invalid weight is set: " << id.tag
                          << ". Now, 'weight' has been set to "
@@ -51,7 +51,7 @@ bool WeightedRandomizedLoadBalancer::Add(Servers& bg, const ServerId& id) {
     bool insert_server =
         bg.server_map.emplace(id.id, bg.server_list.size()).second;
     if (insert_server) {
-        uint64_t current_weight_sum = bg.weight_sum + weight;
+        uint64_t current_weight_sum = bg.weight_sum + weight; // 保存累计权重
         bg.server_list.emplace_back(id.id, weight, current_weight_sum);
         bg.weight_sum = current_weight_sum;
         return true;
@@ -126,28 +126,29 @@ int WeightedRandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
     if (n == 0) {
         return ENODATA;
     }
-
+    // wr 抽中不可用节点时, 会分两轮寻找替代节点
     butil::FlatSet<SocketId> random_traversed;
     uint64_t weight_sum = s->weight_sum;
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n; ++i) { // 第一轮最多抽 n 次, 每次仍按权重随机抽
+        // 让高权重节点占据更大的抽签区间
         uint64_t random_weight = butil::fast_rand_less_than(weight_sum);
         const Server random_server(0, 0, random_weight);
         const auto& server =
             std::lower_bound(s->server_list.begin(), s->server_list.end(),
                              random_server, server_compare);
         const SocketId id = server->id;
-        if (ExcludedServers::IsExcluded(in.excluded, id)) {
+        if (ExcludedServers::IsExcluded(in.excluded, id)) { // 跳过本次重试要避开的节点
             continue;
         }
         random_traversed.insert(id);
-        if (IsServerAvailable(id, out->ptr)) {
+        if (IsServerAvailable(id, out->ptr)) { // 检查抽中的 Socket 是否可用
             // An available server is found.
             return 0;
         }
     }
 
     if (random_traversed.size() < n) {
-        // Try to traverse the remaining servers to find an available server.
+        // 第二轮会从随机位置按步长查找
         uint32_t offset = butil::fast_rand_less_than(n);
         uint32_t stride = bthread::prime_offset();
         for (size_t i = 0; i < n; ++i) {
@@ -158,9 +159,10 @@ int WeightedRandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
             }
             if (IsServerAvailable(id, out->ptr)) {
                 if (!ExcludedServers::IsExcluded(in.excluded, id)) {
-                    // Prioritize servers that are not excluded.
+                    // 优先返回未被排除且可用的节点
                     return 0;
                 }
+                // 可用但曾被排除的节点留作最后机会
             }
         }
     }

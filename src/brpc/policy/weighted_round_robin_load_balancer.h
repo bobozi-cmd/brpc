@@ -55,9 +55,9 @@ private:
         uint64_t weight_sum = 0;
     };
     struct TLS {
-        size_t position = 0;
-        uint64_t stride = 0;
-        Server remain_server;
+        size_t position = 0; // 走到哪个节点
+        uint64_t stride = 0; // 每次前进多少权重份额, stride 会选成与总权重互质的值, 以免一直只落在同一部分份额上
+        Server remain_server; // 当前节点还有多少份额未走完
         // If server list changed, we need calculate a new stride.
         bool IsNeededCalculateNewStride(const uint64_t curr_weight_sum,
                                         const size_t curr_servers_num) {

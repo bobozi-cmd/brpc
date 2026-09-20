@@ -65,12 +65,12 @@ public:
     //       return brpc::DefaultRetryPolicy()->DoRetry(cntl);
     //     }
     //   };
-    virtual bool DoRetry(const Controller* controller) const = 0;
+    virtual bool DoRetry(const Controller* controller) const = 0; // 是否重试
     //                                                   ^
     //                                don't forget the const modifier
 
     // Returns the backoff time in milliseconds before every retry.
-    virtual int32_t GetBackoffTimeMs(const Controller* controller) const { return 0; }
+    virtual int32_t GetBackoffTimeMs(const Controller* controller) const { return 0; } // 重试前等待多久
     //                                                               ^
     //                                             don't forget the const modifier
 
@@ -87,7 +87,7 @@ class RpcRetryPolicy : public RetryPolicy {
 public:
     bool DoRetry(const Controller* controller) const override;
 };
-
+// 固定退避
 class RpcRetryPolicyWithFixedBackoff : public RpcRetryPolicy {
 public:
     RpcRetryPolicyWithFixedBackoff(int32_t backoff_time_ms,
@@ -103,12 +103,12 @@ public:
 
 
 private:
-    int32_t _backoff_time_ms;
+    int32_t _backoff_time_ms; // 每次等待的时间
     // If remaining rpc time is less than `_no_backoff_remaining_rpc_time', no backoff.
-    int32_t _no_backoff_remaining_rpc_time_ms;
+    int32_t _no_backoff_remaining_rpc_time_ms; // RPC 剩余多少ms时不再等待
     bool _retry_backoff_in_pthread;
 };
-
+// 随机退避
 class RpcRetryPolicyWithJitteredBackoff : public RpcRetryPolicy {
 public:
     RpcRetryPolicyWithJitteredBackoff(int32_t min_backoff_time_ms,

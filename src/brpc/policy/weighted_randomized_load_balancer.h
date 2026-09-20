@@ -29,6 +29,7 @@ namespace policy {
 
 // This LoadBalancer selects server as the assigned weight.
 // Weight is got from tag of ServerId.
+// 节点被选中的机会由配置权重决定，而不是每个节点机会相同
 class WeightedRandomizedLoadBalancer : public LoadBalancer {
 public:
     bool AddServer(const ServerId& id) override;

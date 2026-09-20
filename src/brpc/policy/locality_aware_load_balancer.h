@@ -92,8 +92,8 @@ private:
         int64_t ResetWeight(size_t index, int64_t now_us);
 
     private:
-        int64_t _weight;
-        int64_t _base_weight;
+        int64_t _weight; // 考虑未完成请求是否等得太久
+        int64_t _base_weight; // 来自已完成请求的表现
         butil::Mutex _mutex;
         int64_t _begin_time_sum;
         int _begin_time_count;
@@ -101,7 +101,7 @@ private:
         size_t _old_index;
         int64_t _old_weight;
         int64_t _avg_latency;
-        butil::BoundedQueue<TimeInfo> _time_q;
+        butil::BoundedQueue<TimeInfo> _time_q; // 自己管理 max_size = 128 的队列 
         // content of _time_q
         TimeInfo _time_q_items[RECV_QUEUE_SIZE];
     };
@@ -114,7 +114,7 @@ private:
     
     class Servers {
     public:
-        std::vector<ServerInfo> weight_tree;
+        std::vector<ServerInfo> weight_tree; // 用数组存储二叉树, 下标 i 的左右孩子分别是 2i+1、2i+2
         butil::FlatMap<SocketId, size_t> server_map;
 
         Servers() {
@@ -187,21 +187,24 @@ inline int64_t LocalityAwareLoadBalancer::Weight::ResetWeight(
     }
     return diff;
 }
-
+// 选中节点时，累加请求开始时间，并把在途数量加一.
+// dice 是随机数落在该节点权重区间内的位置
 inline LocalityAwareLoadBalancer::Weight::AddInflightResult
 LocalityAwareLoadBalancer::Weight::AddInflight(
     const SelectIn& in, size_t index, int64_t dice) {
     BAIDU_SCOPED_LOCK(_mutex);
-    if (Disabled()) {
+    if (Disabled()) { // 节点正在被移除, 不选择
         AddInflightResult r = { false, 0 };
         return r;
     }
+    // 此前仍未返回的请求重算权重，返回变化量 diff, 当前请求尚未计入
     const int64_t diff = ResetWeight(index, in.begin_time_us);
-    if (_weight < dice) {
+    if (_weight < dice) { // 权重缩小到不足以覆盖这次的 dice, 让调用方重新选节点
         // inflight delay makes the weight too small to choose.
         AddInflightResult r = { false, diff };
         return r;
     }
+    // 将本次开始时间加入 _begin_time_sum，在途数量加一
     _begin_time_sum += in.begin_time_us;
     ++_begin_time_count;
     AddInflightResult r = { true, diff };

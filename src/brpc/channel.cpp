@@ -592,7 +592,7 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         } else {
             cntl->_deadline_us = cntl->timeout_ms() * 1000L + start_send_real_us;
         }
-        const int rc = bthread_timer_add(
+        const int rc = bthread_timer_add( // 在发出原请求前设置一个定时器, 如果到时 RPC 仍未结束, 定时器产生 EBACKUPREQUEST 事件
             &cntl->_timeout_id,
             butil::microseconds_to_timespec(
                 cntl->backup_request_ms() * 1000L + start_send_real_us),

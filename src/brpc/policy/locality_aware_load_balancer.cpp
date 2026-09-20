@@ -310,7 +310,7 @@ int LocalityAwareLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) 
                     return 0;
                 }
                 const Weight::AddInflightResult r =
-                    info.weight->AddInflight(in, index, dice - left);
+                    info.weight->AddInflight(in, index, dice - left); // 记录这次尚未完成的请求
                 if (r.weight_diff) {
                     s->UpdateParentWeights(r.weight_diff, index);
                     _total.fetch_add(r.weight_diff, butil::memory_order_relaxed);
@@ -369,22 +369,25 @@ void LocalityAwareLoadBalancer::Feedback(const CallInfo& info) {
     Weight* w = s->weight_tree[index].weight;
     const int64_t diff = w->Update(info, index);
     if (diff != 0) {
-        s->UpdateParentWeights(diff, index);
+        s->UpdateParentWeights(diff, index); // 更新节点的权重
         _total.fetch_add(diff, butil::memory_order_relaxed);
     }
 }
-
+// 请求完成并反馈时，减去该开始时间，把数量减一:
+// 假设某节点以往平均延迟为 10 ms，现在未完成请求平均已等了 30 ms.
+// 下一次选址检查它时，代码使用默认的 1.5 倍阈值：10 × 1.5 = 15 ms.
+// 因为 30 ms ≥ 15 ms，当前权重会约降为基础权重的 15 / 30 = 1/2
 int64_t LocalityAwareLoadBalancer::Weight::Update(
     const CallInfo& ci, size_t index) {
     const int64_t end_time_us = butil::gettimeofday_us();
-    const int64_t latency = end_time_us - ci.begin_time_us;
+    const int64_t latency = end_time_us - ci.begin_time_us; // 算出实际耗时
     BAIDU_SCOPED_LOCK(_mutex);
     if (Disabled()) {
         // The weight was disabled and will be removed soon, do nothing
         // and the diff is 0.
         return 0;
     }
-
+    // 把这次请求从“在途”计数中减掉
     _begin_time_sum -= ci.begin_time_us;
     --_begin_time_count;
 
@@ -419,11 +422,15 @@ int64_t LocalityAwareLoadBalancer::Weight::Update(
             ndone = ci.controller->retried_count();
             nleft = ci.controller->max_retry() - ndone;
         }
+        // 构造一个用于惩罚的 err_latency, (nleft * 失败耗时 * 惩罚倍率 + ndone * RPC 超时时间) / (ndone + nleft)
+        // 重试机会越少，计算越偏向超时时间, 若 max_retry=0, 直接按超时处理
         const int64_t err_latency =
             (nleft * (int64_t)(latency * FLAGS_punish_error_ratio)
              + ndone * ci.controller->timeout_ms() * 1000L) / (ndone + nleft);
         
         if (!_time_q.empty()) {
+            // 把这份惩罚累加到最近的统计记录, 并更新结束时间, 但是不增加成功样本
+            // 这样统计窗口里的latency_sum增加，成功次数却没增加
             TimeInfo* ti = _time_q.bottom();
             ti->latency_sum += err_latency;
             ti->end_time_us = end_time_us;
@@ -466,6 +473,7 @@ int64_t LocalityAwareLoadBalancer::Weight::Update(
     if (_avg_latency == 0) {
         return 0;
     }
+    // 基础权重 ≈ QPS * WEIGHT_SCALE / 平均延迟
     _base_weight = scaled_qps / _avg_latency;
     return ResetWeight(index, end_time_us);
 }

@@ -880,7 +880,7 @@ void Controller::Call::OnComplete(
     if (need_feedback && c->_lb) {
         const LoadBalancer::CallInfo info =
             { begin_time_us, peer_id, error_code, c };
-        c->_lb->Feedback(info);
+        c->_lb->Feedback(info); // 把这次调用的开始时间、节点和错误码交给 Feedback
     }
 
     // Release the `Socket' we used to send/receive data

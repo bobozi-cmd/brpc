@@ -150,12 +150,12 @@
 # 负载均衡和容错
 ## LoadBalancer
 - 核心抽象API, 覆盖 "节点变化 -> 请求开始 -> 请求结束" 三阶段:
-    - AddServer(const ServerId& server) + RemoveServer(const ServerId& server): 命名服务发现节点变化后, 会通知负载均衡器增加或删除节点. 职责分离: NamingService 负责感知有哪些节点, LoadBalancer 负载选择哪个节点.
-    - SelectServer(const ServerIn& in, SelectOut* out): 每次真正发起请求前, Controller::IssueRPC 调用其选择服务
-    - Feedback(const CallInfo& info): 完成请求后, 告知 LB 请求发给了哪个节点, 耗时多少, 是否发生错误, 自适应算法便可以据此降低慢节点或异常节点的选择概率.
+    - AddServer(const ServerId& server) + RemoveServer(const ServerId& server): 命名服务发现节点变化后, 会通知负载均衡器增加或删除节点. 职责分离: NamingService 负责感知有哪些节点, LoadBalancer 负责选择哪个节点.
+    - SelectServer(const SelectIn& in, SelectOut* out): 每次真正发起请求前, Controller::IssueRPC 调用其选择服务
+    - Feedback(const CallInfo& info): 完成请求后, 告知 LB 本次 Call 的开始时间、目标节点和错误码, 自适应算法可计算延迟并调整后续选择概率.
     - brpc把LB分成两类:
-        - 无反馈算法: RR, Random
-        - 有反馈算法: locality-aware, ...
+        - 无反馈算法: `rr`、`random`、`wrr`、`wr`、一致性哈希
+        - 有反馈算法: `la` (locality-aware)
 
 - Round Robin 为什么不用全局原子计数器做轮询?
     - 最简单的实现: `index = atomic_counter.fetch_add(1) % node_count;`, 但在高并发下，所有线程都会修改同一个原子变量，那个 cache line 会不断在 CPU 核之间同步
@@ -175,5 +175,42 @@
     - `unordered_map` 不能替代 vector: 它的平均 O(1) 是按 key 查找, 并不支持按 RR 下标取得第 i 个元素; 迭代顺序也不稳定, rehash 还会使迭代器失效
     - `unordered_map<ServerId, size_t>` 可以在技术上替代当前辅助索引 map, 将判重和定位降为平均 O(1). 但该索引只在命名服务更新节点时使用, 每次 RPC 的热点选择路径只访问 vector, 因此收益通常有限; `map` 则提供稳定的 O(logN) 最坏复杂度且没有 rehash 延迟峰值
 
+- RandomizedLoadBalancer 和 RR 的区别:
+    - rr 保存每线程的 offset, 下次调用接着往前走, 因此短时间内分布通常更均匀;
+    - random 每次重新随机选起点, 因此连续几次选中 A 完全可能, 请求足够多时才趋向均匀
+
 - ExcludedServers 为什么保存 SocketId, 而不是 IP 地址?
     - 一个地址对应的旧连接可能已经失败，随后又创建了新连接. SocketId 带有对象身份信息, 可以区分同一个IP的新旧 Socket.
+
+## 策略对比
+
+| 策略 | 选择方式 | 是否使用调用结果反馈 | 适合的场景 |
+| --- | --- | --- | --- |
+| `rr` | 每线程保存位置和步长, 近似均匀轮询 | 否 | 节点能力相近, 希望短期分布较均匀 |
+| `random` | 每次随机选起点 | 否 | 节点能力相近, 可接受短期随机波动 |
+| `wrr` | 按配置权重轮询, 每线程保存权重进度 | 否 | 节点能力不同, 权重相对稳定 |
+| `wr` | 按配置权重随机抽取 | 否 | 节点能力不同, 可接受短期随机波动 |
+| `la` | 根据反馈动态调整节点权重并抽取 | 是 | 延迟、负载或网络条件持续变化 |
+| `c_murmurhash` / `c_md5` / `c_ketama` | 根据请求的 `request_code` 做一致性哈希, 当前要求 32 位 | 否 | 缓存、分片等需要稳定映射的场景 |
+
+## `wrr` 与 `wr`: 配置权重
+
+- 权重取自 `ServerId.tag`, 须能解析为正整数; 新节点加入后立即按该权重参与选址, 不自带按时间爬坡.
+- `wrr` 把权重视为一圈份额, 用与总权重互质的步长推进; 线程局部的 `position`、`stride` 和 `remain_server` 保存进度. 它比独立随机抽样更平稳, 但不保证跨线程的全局严格顺序.
+- `wrr` 遇到被排除或不可用的节点, 在本次选择中临时过滤该节点并按剩余权重重算步长; 只有找到可用节点, 才把临时进度写回线程局部状态. 全部不可用时返回 `EHOSTDOWN`.
+- `wr` 保存累计权重, 用随机数和 `lower_bound` 定位节点. 随机抽样可能重复, 因此找不到可用节点时还有一轮查找未试过节点的兜底逻辑.
+
+## `la`: 反馈闭环
+
+- 新节点的初始权重取现有节点的平均权重, 并非从低流量开始预热.
+- `SelectServer()` 选中节点时调用 `AddInflight()`: 先根据已有在途请求的等待时间重算权重, 必要时拒绝这次选择; 真正选中后才累计开始时间和在途数量, 并设置 `need_feedback`.
+- 每次实际 Call 完成后, `Controller::Call::OnComplete()` 将开始时间、节点和错误码交给 `Feedback()`. 成功调用进入最多 128 条记录的统计队列, 基础权重近似为 `QPS * WEIGHT_SCALE / 平均延迟`; 失败调用按耗时、超时及重试阶段构造惩罚, 不被当作一次快速成功.
+- 当前权重还会考虑在途请求: `在途平均等待时间 = 当前时间 - 开始时间之和 / 在途数量`. 当它超过历史平均延迟的阈值时, 即使请求尚未超时, 也会降低节点权重; 不会降到配置的最小权重以下.
+- 按权重选址使用数组形式的二叉树: 每个节点保存自身权重和左子树权重之和, 沿树查找约为 `O(log N)`. `DoublyBufferedData` 保护较少变化的节点列表; 高频变化的权重由共享的 `Weight` 对象、节点锁及原子权重和维护. 读到短暂不一致的权重组合时可能重新选择, 不要求每次读取都是全局原子快照.
+
+## 故障、恢复与冷启动
+
+- 命名服务负责“节点是否属于集群”, `Socket::Address()` 与 `IsAvailable()` 负责“此刻是否可接请求”. `Socket` 失败后, 节点即使仍在候选列表中, 也会被选址跳过; 启用健康检查时, 连接恢复并 `Revive()` 后可重新参与选址.
+- 默认的连接失败处理与可选的请求级熔断不同. 开启 `ChannelOptions.enable_circuit_breaker` 后, 每次 Call 的错误码和耗时进入长、短两套统计; 任一套判定不健康, 就隔离对应的主 `Socket`. 初始化阶段按完整窗口的错误次数预算判定, 而非用最初几个样本的瞬时错误率.
+- 当前源码没有“为每个新节点设置冷启动时长并自动爬坡”的现成开关. 可由发布/服务发现系统分阶段提高 `wrr` 权重, 但修改 tag 会被识别为移除旧节点、加入新节点, 并非原地调权; 若需精确且平滑的冷启动时间, 应扩展自定义 `LoadBalancer`.
+- `min_working_instances` / `hold_seconds` 是 `rr`、`random` 在**整个集群宕机后恢复**时的客户端限流

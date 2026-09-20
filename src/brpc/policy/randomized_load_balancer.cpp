@@ -108,7 +108,7 @@ int RandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
         }
     }
     uint32_t stride = 0;
-    size_t offset = butil::fast_rand_less_than(n);
+    size_t offset = butil::fast_rand_less_than(n); // 为本次调用随机选一个起始节点
     for (size_t i = 0; i < n; ++i) {
         const SocketId id = s->server_list[offset].id;
         if (((i + 1) == n  // always take last chance
@@ -122,7 +122,7 @@ int RandomizedLoadBalancer::SelectServer(const SelectIn& in, SelectOut* out) {
         }
         // If `Address' failed, use `offset+stride' to retry so that
         // this failed server won't be visited again inside for
-        offset = (offset + stride) % n;
+        offset = (offset + stride) % n; // 按一个步长继续寻找其他候选节点
     }
     if (_cluster_recover_policy) {
         _cluster_recover_policy->StartRecover();

@@ -177,7 +177,7 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
     }
     // The servers that can not be chosen.
     std::unordered_set<SocketId> filter;
-    TLS tls_temp = tls;
+    TLS tls_temp = tls; // 在副本上尝试, 找到可用节点后，才把进度写回 tls
     uint64_t remain_weight = s->weight_sum;
     size_t remain_servers = s->server_list.size();
     while (remain_servers > 0) {
@@ -205,33 +205,34 @@ int WeightedRoundRobinLoadBalancer::SelectServer(const SelectIn& in, SelectOut* 
     }
     return EHOSTDOWN;
 }
-
+// 从当前节点开始, 沿着一圈“权重份额”向前走 stride 步, 返回这次走到的最后一个节点
 SocketId WeightedRoundRobinLoadBalancer::GetServerInNextStride(
         const std::vector<Server>& server_list,
         const std::unordered_set<SocketId>& filter,
         TLS& tls) {
     SocketId final_server = INVALID_SOCKET_ID;
-    uint64_t stride = tls.stride;
-    Server& remain = tls.remain_server;
-    if (remain.weight > 0) {
-        if (filter.count(remain.id) == 0) {
-            final_server = remain.id;
-            if (remain.weight > stride) {
+    uint64_t stride = tls.stride; // 本次走路消耗的是局部变量, 不会变更 tls.stride
+    Server& remain = tls.remain_server; // 修改 remain, 就是在保存下次调用的进度
+    if (remain.weight > 0) { // 如果上次停在某个节点内部, 先处理那个节点尚未走完的份额
+        if (filter.count(remain.id) == 0) { // 如果该节点不在 filter 中
+            final_server = remain.id; // 先把它记为本次走到的节点
+            if (remain.weight > stride) { // 剩余份额比本次步长还多, 只在这个节点内部走, 直接返回它
                 remain.weight -= stride;
                 return final_server;
-            } else {
+            } else { // 剩余份额不够: 消耗掉这些份额, 继续走向下一节点
                 stride -= remain.weight;
             }
         }
+        // 如果该节点已在 filter 中, 就不再选择它
         remain.weight = 0;
         ++tls.position;
         tls.position %= server_list.size();
     }
-    while (stride > 0) {
-        final_server = server_list[tls.position].id;
-        if (filter.count(final_server) == 0) {
+    while (stride > 0) { // 只要本次步长尚未走完, 就继续沿节点列表前进
+        final_server = server_list[tls.position].id; // 记录当前走到的节点
+        if (filter.count(final_server) == 0) { // 如果它不在 filter 中, 才消费它的权重份额。
             uint32_t configured_weight = server_list[tls.position].weight;
-            if (configured_weight > stride) {
+            if (configured_weight > stride) { // 节点份额大于剩余步长: 本次停在该节点内部
                 remain.id = final_server;
                 remain.weight = configured_weight - stride;
                 return final_server;
