@@ -214,3 +214,23 @@
 - 默认的连接失败处理与可选的请求级熔断不同. 开启 `ChannelOptions.enable_circuit_breaker` 后, 每次 Call 的错误码和耗时进入长、短两套统计; 任一套判定不健康, 就隔离对应的主 `Socket`. 初始化阶段按完整窗口的错误次数预算判定, 而非用最初几个样本的瞬时错误率.
 - 当前源码没有“为每个新节点设置冷启动时长并自动爬坡”的现成开关. 可由发布/服务发现系统分阶段提高 `wrr` 权重, 但修改 tag 会被识别为移除旧节点、加入新节点, 并非原地调权; 若需精确且平滑的冷启动时间, 应扩展自定义 `LoadBalancer`.
 - `min_working_instances` / `hold_seconds` 是 `rr`、`random` 在**整个集群宕机后恢复**时的客户端限流
+
+# 新增 brpc LoadBalancer 
+- UT编译
+```bash
+./env.sh exec sudo apt-get update
+./env.sh exec sudo apt-get install -y libgoogle-perftools-dev
+
+./env.sh exec env \
+  HTTPS_PROXY=http://host.docker.internal:7890 \
+  HTTP_PROXY=http://host.docker.internal:7890 \
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=http.proxy \
+  GIT_CONFIG_VALUE_0=http://host.docker.internal:7890 \
+  cmake -S . -B build -DBUILD_UNIT_TESTS=ON -DDOWNLOAD_GTEST=ON
+```
+- 执行 UT
+```
+./build/test/brpc_load_balancer_unittest
+```
+

@@ -19,10 +19,16 @@
 
 // Date: Sun Jul 13 15:04:18 CST 2014
 
+#include <cstddef>
 #include <sys/types.h>
 #include <map>
 #include <gtest/gtest.h>
+#include <vector>
+#include "brpc/load_balancer.h"
+#include "brpc/server_id.h"
+#include "brpc/socket_id.h"
 #include "bthread/bthread.h"
+#include "butil/endpoint.h"
 #include "gperftools_helper.h"
 #include "butil/compiler_specific.h"
 #include "butil/containers/doubly_buffered_data.h"
@@ -822,6 +828,75 @@ TEST_F(LoadBalancerTest, consistent_hashing) {
         for (size_t i = 0; i < ids.size(); ++i) {
             ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
         }
+    }
+}
+
+TEST_F(LoadBalancerTest, consistent_hashing_simple) {
+
+    const char* servers[] = { 
+        "10.92.115.19:8833", 
+        "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+        "unix:test.sock",
+    };
+
+    auto hash_type = ::brpc::policy::ConsistentHashingLoadBalancerType::CONS_HASH_LB_MURMUR3;
+    brpc::policy::ConsistentHashingLoadBalancer chlb(hash_type);
+
+    std::vector<brpc::ServerId> ids;
+    std::vector<butil::EndPoint> addrs;
+
+    auto add_server = [&](int i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, butil::str2endpoint(addr, &dummy));
+        brpc::ServerId id;
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        options.user = new SaveRecycle; // SocketOptions::user 是随 Socket 生命周期绑定的回调对象, Socket 真正回收前会调用 BeforeRecycle(socket)
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id)); // 改写 ServerId
+        ids.push_back(id);
+        addrs.push_back(dummy);
+        ASSERT_TRUE(chlb.AddServer(id));
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(servers) - 1; ++i) {
+        add_server(i);
+    }
+
+    // std::cout << chlb;
+
+    const size_t SELECT_TIMES = 4096;
+    std::vector<butil::EndPoint> selected;
+    selected.reserve(SELECT_TIMES);
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = {0, false, false, 0u, NULL};
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    for (size_t i = 0; i < SELECT_TIMES; ++i) {
+        in.has_request_code = true;
+        in.request_code = ::brpc::policy::MurmurHash32((const char *)&i, sizeof(i));
+        ASSERT_EQ(0, chlb.SelectServer(in, &out));
+        selected.push_back(ptr->remote_side());
+    }
+
+    add_server(2);
+
+    // std::cout << chlb;
+    
+    bool changed = false;
+    for (size_t i = 0; i < SELECT_TIMES; ++i) {
+        in.has_request_code = true;
+        in.request_code = ::brpc::policy::MurmurHash32((const char *)&i, sizeof(i));
+        ASSERT_EQ(0, chlb.SelectServer(in, &out));
+        if (ptr->remote_side() != selected[i]) {
+            changed = true;
+            ASSERT_EQ(addrs[2], ptr->remote_side());
+        }
+    }
+    ASSERT_TRUE(changed);
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        // 通过 SetFailed 触发后续回收，避免测试创建的 Socket 一直留在全局资源池里
+        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
     }
 }
 
