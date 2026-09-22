@@ -934,6 +934,14 @@ TEST_F(LoadBalancerTest, smooth_simple) {
     EXPECT_TRUE(slb.AddServer(ids[2]));
     EXPECT_TRUE(slb.RemoveServer(ids[2]));
     EXPECT_FALSE(slb.RemoveServer(ids[2]));
+
+    EXPECT_TRUE(slb.AddServer(ids[2]));
+    std::vector<brpc::ServerId> removed;
+    removed.push_back(ids[0]);
+    removed.push_back(ids[2]);
+
+    EXPECT_EQ(2u, slb.RemoveServersInBatch(removed));
+    EXPECT_EQ(0u, slb.RemoveServersInBatch(removed));
 }
 
 TEST_F(LoadBalancerTest, smooth) {

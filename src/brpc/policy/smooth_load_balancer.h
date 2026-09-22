@@ -32,7 +32,6 @@ private:
   struct Servers {
     std::vector<Server> server_list;
     std::map<SocketId, size_t> server_map;
-    uint64_t weight_sum = 0;
   };
 
   // weight_sum: uint64 -> 2^64/10000

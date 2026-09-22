@@ -26,8 +26,7 @@ SmoothLoadBalancer::AddServersInBatch(const std::vector<ServerId> &servers) {
 
 size_t
 SmoothLoadBalancer::RemoveServersInBatch(const std::vector<ServerId> &servers) {
-  // TODO:
-  return 0;
+  return _db_servers.Modify(BatchRemove, servers);
 }
 
 int SmoothLoadBalancer::SelectServer(const SelectIn &in, SelectOut *out) {
@@ -37,13 +36,11 @@ int SmoothLoadBalancer::SelectServer(const SelectIn &in, SelectOut *out) {
 
 SmoothLoadBalancer *
 SmoothLoadBalancer::New(const butil::StringPiece &params) const {
-  // TODO:
   SmoothLoadBalancer *lb = new (std::nothrow) SmoothLoadBalancer;
   return lb;
 }
 
 void SmoothLoadBalancer::Destroy() {
-  // TODO:
   delete this;
 }
 
@@ -64,7 +61,6 @@ bool SmoothLoadBalancer::Add(Servers &bg, const ServerId &id) {
       bg.server_map.emplace(id.id, bg.server_list.size()).second;
   if (insert_server) {
     bg.server_list.emplace_back(id.id, initial_weight);
-    bg.weight_sum += initial_weight;
     return true;
   }
   return false;
@@ -74,7 +70,6 @@ bool SmoothLoadBalancer::Remove(Servers &bg, const ServerId &id) {
   auto iter = bg.server_map.find(id.id);
   if (iter != bg.server_map.end()) {
     const size_t idx = iter->second;
-    bg.weight_sum -= bg.server_list[idx].weight;
     bg.server_list[idx] = bg.server_list.back();
     bg.server_map[bg.server_list[idx].id] = idx;
     bg.server_list.pop_back();
@@ -100,7 +95,6 @@ size_t SmoothLoadBalancer::BatchAdd(Servers &bg,
         bg.server_map.emplace(id.id, bg.server_list.size()).second;
     if (insert_server) {
       bg.server_list.emplace_back(id.id, initial_weight);
-      bg.weight_sum += initial_weight;
       count++;
     }
   }
