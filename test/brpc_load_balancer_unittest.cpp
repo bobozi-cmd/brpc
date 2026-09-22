@@ -901,6 +901,41 @@ TEST_F(LoadBalancerTest, consistent_hashing_simple) {
     }
 }
 
+TEST_F(LoadBalancerTest, smooth_simple) {
+    const char* servers[] = { 
+        "10.92.115.19:8833", 
+        "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+        "unix:test.sock",
+    };
+
+    brpc::policy::SmoothLoadBalancer slb;
+
+    std::vector<brpc::ServerId> ids;
+    std::vector<butil::EndPoint> addrs;
+    auto add_server_to_batch = [&](int i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, butil::str2endpoint(addr, &dummy));
+        brpc::ServerId id;
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        ids.push_back(id);
+        addrs.push_back(dummy);
+    };
+
+    add_server_to_batch(0);
+    add_server_to_batch(1);
+
+    ASSERT_EQ(2u, slb.AddServersInBatch(ids));
+    EXPECT_FALSE(slb.AddServer(ids[0]));
+
+    add_server_to_batch(2);
+    EXPECT_TRUE(slb.AddServer(ids[2]));
+    EXPECT_TRUE(slb.RemoveServer(ids[2]));
+    EXPECT_FALSE(slb.RemoveServer(ids[2]));
+}
+
 TEST_F(LoadBalancerTest, smooth) {
     const char* servers[] = { 
         "10.92.115.19:8833", 
