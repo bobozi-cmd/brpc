@@ -44,6 +44,7 @@
 #include "brpc/policy/randomized_load_balancer.h"
 #include "brpc/policy/locality_aware_load_balancer.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
+#include "brpc/policy/smooth_load_balancer.h"
 #include "brpc/policy/hasher.h"
 #include "echo.pb.h"
 #include "brpc/channel.h"
@@ -897,6 +898,71 @@ TEST_F(LoadBalancerTest, consistent_hashing_simple) {
     for (size_t i = 0; i < ids.size(); ++i) {
         // 通过 SetFailed 触发后续回收，避免测试创建的 Socket 一直留在全局资源池里
         ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
+    }
+}
+
+TEST_F(LoadBalancerTest, smooth) {
+    const char* servers[] = { 
+        "10.92.115.19:8833", 
+        "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+        "unix:test.sock",
+    };
+
+    brpc::policy::SmoothLoadBalancer slb;
+
+    std::vector<brpc::ServerId> ids;
+    std::vector<butil::EndPoint> addrs;
+    // 默认权重上限 10000(可以配置), 一开始加入新节点, 如果之前没有节点权重为10000, 否则权重为 0, 根据select次数, 逐步上升
+    auto add_server_to_batch = [&](int i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, butil::str2endpoint(addr, &dummy));
+        brpc::ServerId id;
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        ids.push_back(id);
+        addrs.push_back(dummy);
+    };
+
+    add_server_to_batch(0);
+    add_server_to_batch(1);
+    ASSERT_EQ(2u, slb.AddServersInBatch(ids)); // half-half
+
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = {0, false, false, 0u, NULL};
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    auto select_n = [&](size_t n, std::map<butil::EndPoint, size_t>* counts) {
+        counts->clear();
+        for (size_t i = 0; i < n; ++i) {
+            ASSERT_EQ(0, slb.SelectServer(in, &out)); // ASSERT_* 不能放在有返回值的 lambda 中
+            ++(*counts)[ptr->remote_side()];
+        }
+    };
+
+    const size_t SELECT_TIMES = 10000;
+
+    std::map<butil::EndPoint, size_t> before;
+    select_n(SELECT_TIMES, &before);
+    ASSERT_NEAR(before[addrs[0]], before[addrs[1]], 10);
+       
+    add_server_to_batch(2);
+    ASSERT_TRUE(slb.AddServer(ids.back())); // half-half-0
+
+    const size_t WINDOW = 2000;
+    std::map<butil::EndPoint, size_t> early, middle, late;
+    select_n(WINDOW, &early);
+    select_n(WINDOW, &middle);
+    select_n(WINDOW, &late);
+
+    EXPECT_LT(early[addrs[2]], middle[addrs[2]]);
+    EXPECT_LT(middle[addrs[2]], late[addrs[2]]);
+
+    std::map<butil::EndPoint, size_t> steady;
+    select_n(10000, &steady);
+    select_n(30000, &steady);
+    for (size_t i = 0; i < addrs.size(); ++i) {
+        EXPECT_NEAR(steady[addrs[i]], 10000u, 20u);
     }
 }
 
