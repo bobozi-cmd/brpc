@@ -944,6 +944,22 @@ TEST_F(LoadBalancerTest, smooth_simple) {
     EXPECT_EQ(0u, slb.RemoveServersInBatch(removed));
 }
 
+TEST_F(LoadBalancerTest, smooth_select) {
+    std::vector<brpc::policy::SmoothLoadBalancer::Server> servers;
+    servers.emplace_back(1, 5);
+    servers.emplace_back(2, 1);
+    servers.emplace_back(3, 1);
+
+    brpc::policy::SmoothLoadBalancer::TLS tls;
+    const brpc::SocketId expected[] = {
+        1, 1, 2, 1, 3, 1, 1
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(expected); ++i) {
+        EXPECT_EQ(expected[i], brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls));
+    }
+}
+
 TEST_F(LoadBalancerTest, smooth) {
     const char* servers[] = { 
         "10.92.115.19:8833", 

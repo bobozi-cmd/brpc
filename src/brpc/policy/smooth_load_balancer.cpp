@@ -1,6 +1,10 @@
 #include "brpc/policy/smooth_load_balancer.h"
 #include "brpc/server_id.h"
+#include "brpc/socket.h"
+#include "brpc/socket_id.h"
+#include "butil/containers/doubly_buffered_data.h"
 #include "butil/strings/string_number_conversions.h"
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -29,9 +33,62 @@ SmoothLoadBalancer::RemoveServersInBatch(const std::vector<ServerId> &servers) {
   return _db_servers.Modify(BatchRemove, servers);
 }
 
+SocketId
+SmoothLoadBalancer::SelectByWeight(const std::vector<Server> &server_list,
+                                   TLS &tls) {
+
+  if (server_list.empty()) {
+    return INVALID_SOCKET_ID;
+  }
+
+  size_t maxi = 0;
+  int64_t total_w = 0;
+  int64_t max_w = std::numeric_limits<int64_t>::min();
+
+  for (size_t i = 0; i < server_list.size(); ++i) {
+    auto &id = server_list[i].id;
+
+    if (tls.states.count(id) == 0) {
+      tls.states[id] = SelectState();
+      tls.states[id].effective_weight = server_list[i].weight;
+    }
+
+    auto &cur_s = tls.states[id];
+    // 每个节点：current_weight += effective_weight
+    cur_s.current_weight += cur_s.effective_weight;
+    total_w += cur_s.effective_weight;
+    if (cur_s.current_weight > max_w) {
+      // 选择 current_weight 最大的节点
+      max_w = cur_s.current_weight;
+      maxi = i;
+    }
+  }
+
+  auto max_socket_id = server_list[maxi].id;
+  // 被选节点：current_weight -= 所有 effective_weight 之和
+  tls.states[max_socket_id].current_weight -= total_w;
+
+  return max_socket_id;
+}
+
 int SmoothLoadBalancer::SelectServer(const SelectIn &in, SelectOut *out) {
-  // TODO:
-  return 0;
+  TLSScopedPtr s;
+  if (_db_servers.Read(&s) != 0) {
+    return ENOMEM;
+  }
+  if (s->server_list.empty()) {
+    return ENODATA;
+  }
+
+  TLS &tls = s.tls();
+
+  auto target_id = SelectByWeight(s->server_list, tls);
+
+  if (Socket::Address(target_id, out->ptr) == 0 && (*out->ptr)->IsAvailable()) {
+    return 0;
+  }
+
+  return EHOSTDOWN;
 }
 
 SmoothLoadBalancer *
@@ -40,9 +97,7 @@ SmoothLoadBalancer::New(const butil::StringPiece &params) const {
   return lb;
 }
 
-void SmoothLoadBalancer::Destroy() {
-  delete this;
-}
+void SmoothLoadBalancer::Destroy() { delete this; }
 
 void SmoothLoadBalancer::Describe(std::ostream &os,
                                   const DescribeOptions &options) {

@@ -2,9 +2,11 @@
 
 #include "brpc/load_balancer.h"
 #include "brpc/server_id.h"
+#include "brpc/socket_id.h"
 #include "butil/containers/doubly_buffered_data.h"
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace brpc {
@@ -34,6 +36,15 @@ private:
     std::map<SocketId, size_t> server_map;
   };
 
+  struct SelectState {
+    uint32_t effective_weight = 0;  // 本轮实际权重
+    int64_t current_weight = 0; // 调度过程中累计的权重
+  };
+
+  struct TLS {
+    std::map<SocketId, SelectState> states;
+  };
+
   // weight_sum: uint64 -> 2^64/10000
   // = 18TB, uint32 -> 2^32/10000 = 4M
   static const uint32_t MAX_WEIGHT = 10000;
@@ -43,7 +54,11 @@ private:
   static size_t BatchAdd(Servers &bg, const std::vector<ServerId> &servers);
   static size_t BatchRemove(Servers &bg, const std::vector<ServerId> &servers);
 
-  butil::DoublyBufferedData<Servers> _db_servers;
+  static SocketId SelectByWeight(const std::vector<Server> &server_list,
+                                 TLS &tls);
+
+  butil::DoublyBufferedData<Servers, TLS> _db_servers;
+  using TLSScopedPtr = butil::DoublyBufferedData<Servers, TLS>::ScopedPtr;
 };
 
 } // namespace policy
