@@ -960,6 +960,16 @@ TEST_F(LoadBalancerTest, smooth_select) {
     }
 }
 
+TEST_F(LoadBalancerTest, smooth_weight_increase) {
+    std::vector<brpc::policy::SmoothLoadBalancer::Server> servers;
+    servers.emplace_back(1, 0, 3);
+    brpc::policy::SmoothLoadBalancer::TLS tls;
+    brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls);
+    brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls);
+    brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls);
+    EXPECT_EQ(3u, tls.states[servers[0].id].effective_weight);
+}
+
 TEST_F(LoadBalancerTest, smooth) {
     const char* servers[] = { 
         "10.92.115.19:8833", 

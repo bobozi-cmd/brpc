@@ -3,10 +3,10 @@
 #include "brpc/socket.h"
 #include "brpc/socket_id.h"
 #include "butil/containers/doubly_buffered_data.h"
-#include "butil/strings/string_number_conversions.h"
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <new>
 
 namespace brpc {
@@ -50,7 +50,10 @@ SmoothLoadBalancer::SelectByWeight(const std::vector<Server> &server_list,
 
     if (tls.states.count(id) == 0) {
       tls.states[id] = SelectState();
-      tls.states[id].effective_weight = server_list[i].weight;
+      tls.states[id].effective_weight = server_list[i].initial_weight;
+    }
+    if (tls.states[id].effective_weight < server_list[i].target_weight) {
+      ++tls.states[id].effective_weight;
     }
 
     auto &cur_s = tls.states[id];
@@ -115,7 +118,7 @@ bool SmoothLoadBalancer::Add(Servers &bg, const ServerId &id) {
   bool insert_server =
       bg.server_map.emplace(id.id, bg.server_list.size()).second;
   if (insert_server) {
-    bg.server_list.emplace_back(id.id, initial_weight);
+    bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT);
     return true;
   }
   return false;
@@ -149,7 +152,7 @@ size_t SmoothLoadBalancer::BatchAdd(Servers &bg,
     bool insert_server =
         bg.server_map.emplace(id.id, bg.server_list.size()).second;
     if (insert_server) {
-      bg.server_list.emplace_back(id.id, initial_weight);
+      bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT);
       count++;
     }
   }

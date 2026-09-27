@@ -25,10 +25,15 @@ public:
 
 private:
   struct Server {
-    explicit Server(SocketId s_id = 0, uint32_t s_w = 0)
-        : id(s_id), weight(s_w) {}
+    Server(SocketId id, uint32_t fixed_weight)
+        : id(id), initial_weight(fixed_weight), target_weight(fixed_weight) {}
+
+    Server(SocketId id, uint32_t initial, uint32_t target)
+        : id(id), initial_weight(initial), target_weight(target) {}
+
     SocketId id;
-    uint32_t weight;
+    uint32_t initial_weight;
+    uint32_t target_weight;
   };
 
   struct Servers {
@@ -37,8 +42,8 @@ private:
   };
 
   struct SelectState {
-    uint32_t effective_weight = 0;  // 本轮实际权重
-    int64_t current_weight = 0; // 调度过程中累计的权重
+    uint32_t effective_weight = 0; // 本轮实际权重
+    int64_t current_weight = 0;    // 调度过程中累计的权重
   };
 
   struct TLS {
