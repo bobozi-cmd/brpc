@@ -234,3 +234,105 @@
 ./build/test/brpc_load_balancer_unittest
 ```
 
+## SmoothLoadBalancer 
+
+### 目标
+
+- 为新加入的节点提供冷启动能力, 避免节点一加入就立刻承担和老节点相同的流量.
+- 使用平滑加权轮询分配请求. 每轮先给所有候选节点累计有效权重, 选择累计权重最大的节点, 再从该节点扣除本轮总权重:
+    ```text
+    current_weight += effective_weight
+    selected = max(current_weight)
+    selected.current_weight -= total_effective_weight
+    ```
+- `current_weight` 可以理解为流量欠账: 正数表示节点应该尽快获得请求, 负数表示节点刚获得请求、短期内应让出机会. 这使长期流量比例收敛到权重比例, 同时避免低权重节点的请求集中出现.
+
+### 已实现的功能
+
+- 完成 `LoadBalancer` 基础接口:
+    - `AddServer()` / `RemoveServer()`;
+    - `AddServersInBatch()` / `RemoveServersInBatch()`;
+    - `SelectServer()` / `New()` / `Destroy()` / `Describe()` 的基本框架.
+- 使用 `DoublyBufferedData<Servers, TLS>` 管理节点列表和线程局部调度状态:
+    - `server_list` 用于选址遍历;
+    - `server_map` 用于判重、删除定位和 TLS 状态清理;
+    - 节点更新不会要求选择请求与写操作互斥.
+- 完成平滑加权轮询核心算法, 固定权重 `5:1:1` 可产生平滑序列 `A, A, B, A, C, A, A`.
+- 完成新节点逐步增权:
+    - 空集群首次批量加入的节点直接使用最大权重;
+    - 集群已有节点时, 新节点从权重 0 开始;
+    - 每次参与当前线程的选择时, `effective_weight` 增加 1, 直到 `target_weight`.
+- 完成故障和重试过滤:
+    - 通过 `IsServerAvailable()` 跳过不可用或已下线的 Socket;
+    - 优先排除 `ExcludedServers` 中本次 RPC 已失败的节点;
+    - 没有非排除候选节点时, 忽略 `ExcludedServers` 再尝试可用节点;
+    - 无节点返回 `ENODATA`, 有节点但全部不可用返回 `EHOSTDOWN`.
+- 完成节点状态生命周期管理:
+    - 每次加入节点都会获得新的 `generation`, 同一个 `SocketId` 删除后再加入时不会继承旧预热进度;
+    - `Servers::membership_version` 记录成员变化;
+    - 每个 TLS 保存 `observed_membership_version`, 只在成员版本变化时扫描并删除已经离开集群的状态, 稳定期间每次选择只需比较版本号;
+    - TLS 由使用它的线程在下一次 `SelectServer()` 时清理, `RemoveServer()` 不会跨线程修改其他线程的 TLS.
+- 已在 `global.cpp` 中以 `smooth` 注册, 设计目标是支持:
+    ```cpp
+    channel.Init(naming_service_url, "smooth", &options);
+    ```
+- 已编写以下单元测试场景:
+    - 单个和批量增删、重复添加和重复删除;
+    - 固定权重的平滑选择序列;
+    - 新节点有效权重逐步增加;
+    - 不可用节点过滤;
+    - `ExcludedServers` 过滤;
+    - 新节点早期、中期和稳定阶段的流量分布;
+    - 相同 `SocketId` 重新加入后的 generation 重置;
+    - 成员删除后的 TLS 状态清理.
+
+### 当前预热语义
+
+- `effective_weight` 和 `current_weight` 当前保存在 TLS 中, 因此预热进度是 **每个 pthread 独立维护** 的:
+    - 一个线程完成 10000 次选择, 不会推进其他线程中的预热进度;
+    - 新工作线程第一次看到节点时仍从初始权重开始;
+    - 实际完成预热的速度取决于请求如何分布到工作线程, 不能直接由整个 Channel 的总 QPS 推导.
+- 不可用或被排除的节点不参与本轮选择, 本线程中的有效权重也不会在这一轮增长.
+- Socket 只是暂时故障并随后健康恢复时, 因为节点没有从命名服务删除, 会保留之前的预热进度. 节点被删除再加入时会获得新 generation 并重新预热.
+- SmoothLB 不依赖请求内容或调用结果, 因此不需要 `request_code` 和 `Feedback()`.
+
+### 尚未完成的基础能力
+
+1. **确定预热作用域**
+    - 需要明确产品语义是“每线程独立预热”还是“整个 LoadBalancer 共享一个预热进度”.
+    - 如果要求全局一致, 当前 TLS 权重设计需要调整. 可考虑根据单调时间和节点加入时间计算有效权重, 避免在热点路径上维护共享原子计数器:
+        ```text
+        effective_weight = min(target_weight,
+                               elapsed_time / warmup_duration * target_weight)
+        ```
+2. **配置解析和参数校验**
+    - `New(params)` 当前忽略所有参数;
+    - 最大权重和每次增长值仍是编译期固定值;
+    - 需要确定并实现类似 `smooth:warmup_steps=10000` 或 `smooth:warmup_ms=30000` 的配置;
+    - 空值、0、溢出和未知参数应使 `New()` 失败.
+3. **完善 `Describe()`**
+    - 非 verbose 模式应输出 `smooth`;
+    - verbose 模式至少输出节点数量、预热配置及每个节点的初始权重、目标权重和 generation;
+    - TLS 权重不是全局状态, 输出时不能把单个线程的值描述成全局当前权重.
+4. **补齐错误路径测试**
+    - 空节点返回 `ENODATA`;
+    - 全部节点不可用返回 `EHOSTDOWN`;
+    - 所有节点都被排除时的最后兜底;
+    - 空批量增删;
+    - 非法参数;
+    - 通过 `SharedLoadBalancer::Init("smooth")` 验证注册路径.
+5. **补齐并发测试**
+    - 多线程持续执行 `SelectServer()`;
+    - 同时反复增加和删除节点;
+    - 验证没有崩溃、越界、无效 Socket、TLS 状态串用或 generation 失效.
+6. **完成实际构建验证**
+    - 当前代码需要在 Linux 开发容器中重新配置, 确保 CMake 的源码 glob 收录新增 `.cpp`;
+    - 运行 SmoothLB 相关测试和完整 `brpc_load_balancer_unittest`;
+    - 当前宿主环境的 Docker daemon 未运行, 最近一次评审未能完成实际编译和测试.
+
+### 上线或提交前的工程工作
+
+- 优化热点路径. 当前每次选择会扫描全部节点、Address 全部候选节点、创建两个 vector, 并对每个节点执行 `std::map` 查找, 大致为 `O(N log N)` 加每请求动态分配. 可考虑在 TLS 中复用候选容器、保存候选下标、减少重复查找, 并增加多节点基准测试.
+- 决定是否支持不同节点容量. 当前所有节点的目标权重相同, `ServerId.tag` 没有被用作目标权重.
+- 评估是否需要 `rr` / `random` 的集群整体恢复限流能力, 即 `min_working_instances` 和 `hold_seconds`; 这不是平滑预热算法本身的必需功能.
+
