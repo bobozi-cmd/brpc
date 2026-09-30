@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <new>
 #include <utility>
 #include <vector>
@@ -51,23 +52,25 @@ SmoothLoadBalancer::SelectByWeight(const std::vector<Server> &server_list,
   int64_t max_w = std::numeric_limits<int64_t>::min();
 
   for (size_t i = 0; i < server_list.size(); ++i) {
-    auto &id = server_list[i].id;
+    const auto &server = server_list[i];
+    const auto &id = server.id;
+    auto result = tls.states.emplace(id, SelectState());
+    SelectState &state = result.first->second;
 
-    if (tls.states.count(id) == 0) {
-      tls.states[id] = SelectState();
-      tls.states[id].effective_weight = server_list[i].initial_weight;
-    }
-    if (tls.states[id].effective_weight < server_list[i].target_weight) {
-      ++tls.states[id].effective_weight;
+    if (result.second || state.generation != server.generation) {
+      state = SelectState();
+      state.effective_weight = server.initial_weight;
+      state.generation = server.generation;
     }
 
-    auto &cur_s = tls.states[id];
-    // 每个节点：current_weight += effective_weight
-    cur_s.current_weight += cur_s.effective_weight;
-    total_w += cur_s.effective_weight;
-    if (cur_s.current_weight > max_w) {
-      // 选择 current_weight 最大的节点
-      max_w = cur_s.current_weight;
+    if (tls.states[id].effective_weight < server.target_weight) {
+      ++state.effective_weight;
+    }
+
+    state.current_weight += state.effective_weight;
+    total_w += state.effective_weight;
+    if (state.current_weight > max_w) {
+      max_w = state.current_weight;
       maxi = i;
     }
   }
@@ -85,11 +88,22 @@ int SmoothLoadBalancer::SelectServer(const SelectIn &in, SelectOut *out) {
     return ENOMEM;
   }
   const size_t n = s->server_list.size();
+  TLS &tls = s.tls();
+
+  if (tls.observed_membership_version != s->membership_version) {
+    for (auto it = tls.states.begin(); it != tls.states.end();) {
+      if (s->server_map.find(it->first) == s->server_map.end()) {
+        it = tls.states.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    tls.observed_membership_version = s->membership_version;
+  }
+
   if (n == 0) {
     return ENODATA;
   }
-
-  TLS &tls = s.tls();
 
   std::vector<Server> candidates;
   std::vector<SocketUniquePtr> candidate_sockets;
@@ -152,7 +166,9 @@ bool SmoothLoadBalancer::Add(Servers &bg, const ServerId &id) {
   bool insert_server =
       bg.server_map.emplace(id.id, bg.server_list.size()).second;
   if (insert_server) {
-    bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT);
+    bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT,
+                                bg.next_generation++);
+    ++bg.membership_version;
     return true;
   }
   return false;
@@ -166,6 +182,7 @@ bool SmoothLoadBalancer::Remove(Servers &bg, const ServerId &id) {
     bg.server_map[bg.server_list[idx].id] = idx;
     bg.server_list.pop_back();
     bg.server_map.erase(iter);
+    ++bg.membership_version; // BatchRemove 当前复用 Remove，会让版本增加多次, 不影响正确性
     return true;
   }
   return false;
@@ -186,9 +203,13 @@ size_t SmoothLoadBalancer::BatchAdd(Servers &bg,
     bool insert_server =
         bg.server_map.emplace(id.id, bg.server_list.size()).second;
     if (insert_server) {
-      bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT);
+      bg.server_list.emplace_back(id.id, initial_weight, MAX_WEIGHT, bg.next_generation++);
       count++;
     }
+  }
+
+  if (count != 0) { // 批量添加只增加一次成员版本
+    ++bg.membership_version;
   }
 
   return count;

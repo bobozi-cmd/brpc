@@ -1125,6 +1125,30 @@ TEST_F(LoadBalancerTest, smooth) {
     for (size_t i = 0; i < addrs.size(); ++i) {
         EXPECT_NEAR(steady[addrs[i]], 10000u, 20u);
     }
+
+    // 同一个 SocketId 删除后立即重新加入，不能继承已经预热完成的状态。
+    ASSERT_TRUE(slb.RemoveServer(ids[2]));
+    ASSERT_TRUE(slb.AddServer(ids[2]));
+
+    std::map<butil::EndPoint, size_t> one_selection;
+    select_n(1, &one_selection);
+
+    {
+        brpc::policy::SmoothLoadBalancer::TLSScopedPtr state;
+        ASSERT_EQ(0, slb._db_servers.Read(&state));
+        EXPECT_EQ(1u, state.tls().states[ids[2].id].effective_weight);
+    }
+
+    // 删除后执行下一次选择，对应线程应清除遗留状态。
+    ASSERT_TRUE(slb.RemoveServer(ids[2]));
+    select_n(1, &one_selection);
+
+    {
+        brpc::policy::SmoothLoadBalancer::TLSScopedPtr state;
+        ASSERT_EQ(0, slb._db_servers.Read(&state));
+        EXPECT_EQ(0u, state.tls().states.count(ids[2].id));
+    }
+
     for (size_t i = 0; i < ids.size(); ++i) {
         ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
     }
