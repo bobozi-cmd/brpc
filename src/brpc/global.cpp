@@ -49,6 +49,7 @@
 #include "brpc/policy/consistent_hashing_load_balancer.h"
 #include "brpc/policy/hasher.h"
 #include "brpc/policy/dynpart_load_balancer.h"
+#include "brpc/policy/smooth_load_balancer.h"
 
 
 // Span
@@ -159,6 +160,7 @@ struct GlobalExtensions {
     ConsistentHashingLoadBalancer ch_md5_lb;
     ConsistentHashingLoadBalancer ch_ketama_lb;
     DynPartLoadBalancer dynpart_lb;
+    SmoothLoadBalancer smooth_lb;
 
     AutoConcurrencyLimiter auto_cl;
     ConstantConcurrencyLimiter constant_cl;
@@ -395,6 +397,7 @@ static void GlobalInitializeOrDieImpl() {
     LoadBalancerExtension()->RegisterOrDie("c_md5", &g_ext->ch_md5_lb);
     LoadBalancerExtension()->RegisterOrDie("c_ketama", &g_ext->ch_ketama_lb);
     LoadBalancerExtension()->RegisterOrDie("_dynpart", &g_ext->dynpart_lb);
+    LoadBalancerExtension()->RegisterOrDie("smooth", &g_ext->smooth_lb);
 
     // Compress Handlers
     CompressHandler gzip_compress = { GzipCompress, GzipDecompress, "gzip" };

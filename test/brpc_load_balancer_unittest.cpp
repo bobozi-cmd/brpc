@@ -24,6 +24,7 @@
 #include <map>
 #include <gtest/gtest.h>
 #include <vector>
+#include "brpc/builtin_service.pb.h"
 #include "brpc/load_balancer.h"
 #include "brpc/server_id.h"
 #include "brpc/socket_id.h"
@@ -942,6 +943,10 @@ TEST_F(LoadBalancerTest, smooth_simple) {
 
     EXPECT_EQ(2u, slb.RemoveServersInBatch(removed));
     EXPECT_EQ(0u, slb.RemoveServersInBatch(removed));
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
+    }
 }
 
 TEST_F(LoadBalancerTest, smooth_select) {
@@ -968,6 +973,92 @@ TEST_F(LoadBalancerTest, smooth_weight_increase) {
     brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls);
     brpc::policy::SmoothLoadBalancer::SelectByWeight(servers, tls);
     EXPECT_EQ(3u, tls.states[servers[0].id].effective_weight);
+}
+
+TEST_F(LoadBalancerTest, smooth_down_filter) {
+    const char* servers[] = { 
+        "10.92.115.19:8833", 
+        "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+    };
+
+    brpc::policy::SmoothLoadBalancer slb;
+
+    std::vector<brpc::ServerId> ids;
+    std::vector<butil::EndPoint> addrs;
+    auto add_server_to_batch = [&](int i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, butil::str2endpoint(addr, &dummy));
+        brpc::ServerId id;
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        ids.push_back(id);
+        addrs.push_back(dummy);
+    };
+
+    add_server_to_batch(0);
+    add_server_to_batch(1);
+    ASSERT_EQ(2u, slb.AddServersInBatch(ids));
+    
+    brpc::SocketUniquePtr sa;
+    ASSERT_EQ(0, brpc::Socket::Address(ids[0].id, &sa));
+    sa->SetLogOff(); // 让 A 下线
+
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = {0, false, false, 0u, NULL};
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    for (size_t i = 0; i < 10; ++i) {
+        ASSERT_EQ(0, slb.SelectServer(in, &out));
+        EXPECT_EQ(ids[1].id, ptr->id());
+    }
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
+    }
+}
+
+TEST_F(LoadBalancerTest, smooth_exclude_filter) {
+    const char* servers[] = { 
+        "10.92.115.19:8833", 
+        "[2408:871a:2100:3:0:ff:b025:348d]:8833",
+    };
+
+    brpc::policy::SmoothLoadBalancer slb;
+
+    std::vector<brpc::ServerId> ids;
+    std::vector<butil::EndPoint> addrs;
+    auto add_server_to_batch = [&](int i) {
+        const char *addr = servers[i];
+        butil::EndPoint dummy;
+        ASSERT_EQ(0, butil::str2endpoint(addr, &dummy));
+        brpc::ServerId id;
+        brpc::SocketOptions options;
+        options.remote_side = dummy;
+        ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+        ids.push_back(id);
+        addrs.push_back(dummy);
+    };
+
+    add_server_to_batch(0);
+    add_server_to_batch(1);
+    ASSERT_EQ(2u, slb.AddServersInBatch(ids));
+
+    brpc::ExcludedServers* excluded = brpc::ExcludedServers::Create(1);
+    excluded->Add(ids[0].id);
+
+
+    brpc::SocketUniquePtr ptr;
+    brpc::LoadBalancer::SelectIn in = {0, false, false, 0u, NULL};
+    in.excluded = excluded;
+    brpc::LoadBalancer::SelectOut out(&ptr);
+    ASSERT_EQ(0, slb.SelectServer(in, &out));
+    EXPECT_EQ(ids[1].id, ptr->id());
+
+    brpc::ExcludedServers::Destroy(excluded);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
+    }
 }
 
 TEST_F(LoadBalancerTest, smooth) {
@@ -1032,6 +1123,9 @@ TEST_F(LoadBalancerTest, smooth) {
     select_n(30000, &steady);
     for (size_t i = 0; i < addrs.size(); ++i) {
         EXPECT_NEAR(steady[addrs[i]], 10000u, 20u);
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
     }
 }
 

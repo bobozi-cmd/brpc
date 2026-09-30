@@ -1,4 +1,5 @@
 #include "brpc/policy/smooth_load_balancer.h"
+#include "brpc/excluded_servers.h"
 #include "brpc/server_id.h"
 #include "brpc/socket.h"
 #include "brpc/socket_id.h"
@@ -8,9 +9,13 @@
 #include <cstdint>
 #include <limits>
 #include <new>
+#include <utility>
+#include <vector>
 
 namespace brpc {
 namespace policy {
+
+const uint32_t SmoothLoadBalancer::MAX_WEIGHT;
 
 bool SmoothLoadBalancer::AddServer(const ServerId &id) {
   return _db_servers.Modify(Add, id);
@@ -79,16 +84,45 @@ int SmoothLoadBalancer::SelectServer(const SelectIn &in, SelectOut *out) {
   if (_db_servers.Read(&s) != 0) {
     return ENOMEM;
   }
-  if (s->server_list.empty()) {
+  const size_t n = s->server_list.size();
+  if (n == 0) {
     return ENODATA;
   }
 
   TLS &tls = s.tls();
 
-  auto target_id = SelectByWeight(s->server_list, tls);
+  std::vector<Server> candidates;
+  std::vector<SocketUniquePtr> candidate_sockets;
 
-  if (Socket::Address(target_id, out->ptr) == 0 && (*out->ptr)->IsAvailable()) {
-    return 0;
+  for (size_t i = 0; i < n; ++i) {
+    const Server &server = s->server_list[i];
+    SocketUniquePtr ptr;
+    if (!ExcludedServers::IsExcluded(in.excluded, server.id) &&
+        IsServerAvailable(server.id, &ptr)) {
+      candidates.push_back(server);
+      candidate_sockets.push_back(std::move(ptr));
+    }
+  }
+
+  if (candidates.empty()) {
+    for (size_t i = 0; i < n; ++i) {
+      const Server &server = s->server_list[i];
+      SocketUniquePtr ptr;
+      if (IsServerAvailable(server.id, &ptr)) {
+        candidates.push_back(server);
+        candidate_sockets.push_back(std::move(ptr));
+      }
+    }
+  }
+
+  if (!candidates.empty()) {
+    const auto target_id = SelectByWeight(candidates, tls);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (candidates[i].id == target_id) {
+        *out->ptr = std::move(candidate_sockets[i]);
+        return 0;
+      }
+    }
   }
 
   return EHOSTDOWN;
