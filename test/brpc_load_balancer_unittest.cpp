@@ -1004,6 +1004,7 @@ TEST_F(LoadBalancerTest, smooth_down_filter) {
     brpc::SocketUniquePtr sa;
     ASSERT_EQ(0, brpc::Socket::Address(ids[0].id, &sa));
     sa->SetLogOff(); // 让 A 下线
+    sa.reset();
 
     brpc::SocketUniquePtr ptr;
     brpc::LoadBalancer::SelectIn in = {0, false, false, 0u, NULL};
@@ -1013,9 +1014,9 @@ TEST_F(LoadBalancerTest, smooth_down_filter) {
         EXPECT_EQ(ids[1].id, ptr->id());
     }
 
-    for (size_t i = 0; i < ids.size(); ++i) {
-        ASSERT_EQ(0, brpc::Socket::SetFailed(ids[i].id));
-    }
+    ptr.reset();
+    // A 已经由 SetLogOff() 内部 SetFailed，只需清理 B。
+    ASSERT_EQ(0, brpc::Socket::SetFailed(ids[1].id));
 }
 
 TEST_F(LoadBalancerTest, smooth_exclude_filter) {
